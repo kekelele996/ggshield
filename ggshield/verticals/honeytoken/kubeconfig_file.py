@@ -37,7 +37,7 @@ import io
 import os
 import warnings
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ruamel.yaml import YAML
 
@@ -105,6 +105,9 @@ class _Identity:
         self.user_entry = user
         self.context_entry = ctx
         self.bearer: Optional[str] = _mapping(user.get("user")).get("token")
+        # The decoy cluster's API server — the human-readable "which cluster" label
+        # the placement plan reports (no token material in it).
+        self.server: Optional[str] = _mapping(cluster.get("cluster")).get("server")
 
 
 def kube_path(home: Path, filename: str) -> Path:
@@ -410,6 +413,77 @@ def _is_empty(doc: Dict[str, Any]) -> bool:
     return not any(line.lstrip().startswith("#") for line in _dump(doc).splitlines())
 
 
+# --- pure staging (text in, text out — no disk) -----------------------------------
+#
+# Same split as the AWS backend: the transactional planner decides and renders the
+# whole target set against in-memory text, publishing only once every entry is known
+# to apply cleanly.
+
+
+def kube_identity(token: KubeconfigToken) -> "_Identity":
+    """The named identity (context/cluster/user/server) a token contributes — the
+    "which cluster" label the placement plan reports."""
+    return _Identity(token)
+
+
+def _stage_write_with_ident(
+    ident: "_Identity", text: Optional[str], force: bool, path: Path
+) -> Tuple[WriteOutcome, Optional[str]]:
+    doc = _load_doc(text, str(path))
+    outcome = _decide_write(doc, ident, force, path)
+    if outcome is not WriteOutcome.WROTE:
+        return outcome, None
+    return outcome, _dump(doc)
+
+
+def _stage_remove_with_ident(
+    ident: "_Identity", text: Optional[str], path: Path
+) -> Tuple[RemoveOutcome, Optional[str]]:
+    doc = _load_doc(text, str(path))
+    outcome = _decide_remove(doc, ident)
+    if outcome is not RemoveOutcome.REMOVED:
+        return outcome, None
+    return outcome, None if _is_empty(doc) else _dump(doc)
+
+
+def stage_kubeconfig_write(
+    text: Optional[str], token: KubeconfigToken, force: bool, path: Path
+) -> Tuple["_Identity", WriteOutcome, Optional[str]]:
+    """Decide a write against ``text`` and render the resulting file. Pure: no I/O.
+    See :func:`kube_identity` and the AWS :func:`stage_aws_write` for the vocabulary."""
+    ident = _Identity(token)
+    outcome, content = _stage_write_with_ident(ident, text, force, path)
+    return ident, outcome, content
+
+
+def stage_kubeconfig_remove(
+    text: Optional[str], token: KubeconfigToken, path: Path
+) -> Tuple["_Identity", RemoveOutcome, Optional[str]]:
+    """Decide a remove against ``text`` and render the resulting file. Pure: no I/O."""
+    ident = _Identity(token)
+    outcome, content = _stage_remove_with_ident(ident, text, path)
+    return ident, outcome, content
+
+
+def summarize_kubeconfig(text: Optional[str], where: str) -> List[str]:
+    """The kubeconfig identities a file currently holds — other context names and the
+    active context, so the plan can show whose cluster access lives beside the decoy.
+    Names only (never bearers); an unparseable file yields nothing."""
+    try:
+        doc = _load_doc(text, where)
+    except PlacementError:
+        return []
+    lines = [
+        f"context [{ctx.get('name')}]"
+        for ctx in _named_list(doc, "contexts")
+        if isinstance(ctx, dict) and ctx.get("name")
+    ]
+    current = doc.get("current-context")
+    if isinstance(current, str) and current:
+        lines.append(f"current-context [{current}]")
+    return lines
+
+
 # --- public API -------------------------------------------------------------------
 
 
@@ -430,21 +504,21 @@ def write_kubeconfig(
         if secure_file.FD_HARDENED:
             dir_fd = secure_file.open_dir_fd(path.parent, create=True)
             try:
-                doc = _load_doc(secure_file.read_via_fd(dir_fd, path.name), str(path))
-                outcome = _decide_write(doc, ident, force, path)
+                outcome, content = _stage_write_with_ident(
+                    ident, secure_file.read_via_fd(dir_fd, path.name), force, path
+                )
                 if outcome is WriteOutcome.WROTE:
-                    secure_file.atomic_write_via_fd(
-                        dir_fd, path.name, _dump(doc), owner
-                    )
+                    secure_file.atomic_write_via_fd(dir_fd, path.name, content, owner)
                 return outcome
             finally:
                 os.close(dir_fd)
 
         secure_file.reject_symlinked_target(path)
-        doc = _load_doc(secure_file.read_path(path), str(path))
-        outcome = _decide_write(doc, ident, force, path)
+        outcome, content = _stage_write_with_ident(
+            ident, secure_file.read_path(path), force, path
+        )
         if outcome is WriteOutcome.WROTE:
-            secure_file.atomic_write_path(path, _dump(doc))
+            secure_file.atomic_write_path(path, content)
         return outcome
     except (SecureFileError, OSError) as exc:
         raise PlacementError(str(exc))
@@ -469,16 +543,13 @@ def remove_kubeconfig(
                 text = secure_file.read_via_fd(dir_fd, path.name)
                 if text is None:
                     return RemoveOutcome.ALREADY_ABSENT
-                doc = _load_doc(text, str(path))
-                outcome = _decide_remove(doc, ident)
+                outcome, content = _stage_remove_with_ident(ident, text, path)
                 if outcome is not RemoveOutcome.REMOVED:
                     return outcome
-                if _is_empty(doc):
+                if content is None:
                     secure_file.unlink_via_fd(dir_fd, path.name)
                 else:
-                    secure_file.atomic_write_via_fd(
-                        dir_fd, path.name, _dump(doc), owner
-                    )
+                    secure_file.atomic_write_via_fd(dir_fd, path.name, content, owner)
                 return outcome
             finally:
                 os.close(dir_fd)
@@ -487,14 +558,13 @@ def remove_kubeconfig(
         text = secure_file.read_path(path)
         if text is None:
             return RemoveOutcome.ALREADY_ABSENT
-        doc = _load_doc(text, str(path))
-        outcome = _decide_remove(doc, ident)
+        outcome, content = _stage_remove_with_ident(ident, text, path)
         if outcome is not RemoveOutcome.REMOVED:
             return outcome
-        if _is_empty(doc):
+        if content is None:
             secure_file.unlink_path(path)
         else:
-            secure_file.atomic_write_path(path, _dump(doc))
+            secure_file.atomic_write_path(path, content)
         return outcome
     except (SecureFileError, OSError) as exc:
         raise PlacementError(str(exc))

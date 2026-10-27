@@ -170,11 +170,16 @@ def test_remove_only_reapplies_ownership_when_file_survives(
     with open(aws_dir / "credentials", "w") as handle:
         parser.write(handle)
 
-    reapplied: list = []
-    monkeypatch.setattr(
-        "ggshield.cmd.honeytoken.plant.apply_dir_perms_and_owner",
-        lambda path, target, running_as_root: reapplied.append(Path(path)),
-    )
+    from ggshield.verticals.honeytoken import staging
+
+    fixed_up: list = []
+    real_fixup = staging._fixup_dirs_via_fd
+
+    def _spy_fixup(dirs, files, running_as_root):
+        fixed_up.extend(files)
+        return real_fixup(dirs, files, running_as_root)
+
+    monkeypatch.setattr(staging, "_fixup_dirs_via_fd", _spy_fixup)
 
     mock = _install_mock(monkeypatch)
     mock.add_GET(
@@ -192,9 +197,10 @@ def test_remove_only_reapplies_ownership_when_file_survives(
     )
 
     assert_invoke_ok(result)
-    # The file survived (the foreign 'default' profile remains) and was re-permed.
+    # The file survived (the foreign 'default' profile remains) and its directory was
+    # re-permed/handed back as part of the atomic commit.
     assert (aws_dir / "credentials").exists()
-    assert Path("home/.aws/credentials") in reapplied
+    assert Path("home/.aws/credentials") in [f.path for f in fixed_up]
     # The user's own profile is intact.
     assert (
         _section(aws_dir / "credentials", "default")["aws_access_key_id"] == "USER_OWN"
@@ -216,10 +222,13 @@ def test_remove_only_skips_reapply_when_file_deleted(
     with open(aws_dir / "credentials", "w") as handle:
         parser.write(handle)
 
-    reapplied: list = []
+    from ggshield.verticals.honeytoken import staging
+
+    fixed_up: list = []
     monkeypatch.setattr(
-        "ggshield.cmd.honeytoken.plant.apply_dir_perms_and_owner",
-        lambda *a, **k: reapplied.append(a),
+        staging,
+        "_fixup_dirs_via_fd",
+        lambda dirs, files, running_as_root: fixed_up.extend(files),
     )
 
     mock = _install_mock(monkeypatch)
@@ -239,7 +248,8 @@ def test_remove_only_skips_reapply_when_file_deleted(
 
     assert_invoke_ok(result)
     assert not (aws_dir / "credentials").exists()
-    assert reapplied == []
+    # No surviving file → the directory is not re-permed/chowned.
+    assert fixed_up == []
 
 
 def test_malformed_credentials_file_fails_cleanly(
@@ -333,15 +343,24 @@ def test_target_resolution_failure_is_clean(
 def test_unexpected_per_target_error_does_not_crash(
     cli_fs_runner: CliRunner, monkeypatch
 ) -> None:
-    # Last-resort net: an unexpected failure for a target is reported, not raised.
+    # Last-resort net: an unexpected failure while planning a target is reported, not
+    # raised, and aborts the run before any file is written.
     def _boom(*_a, **_k):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr("ggshield.cmd.honeytoken.plant._reconcile_for_user", _boom)
+    monkeypatch.setattr("ggshield.cmd.honeytoken.plant.build_user_plan", _boom)
+    mock = _install_mock(monkeypatch)
+    mock.add_POST(
+        ENDPOINT,
+        create_json_response(
+            {"deployments": [_deployment("write", token=("AKIAEXAMPLE", "s3cr3t"))]}
+        ),
+    )
     result = cli_fs_runner.invoke(cli, ["honeytoken", "plant", "--user-dir", "home"])
     assert_invoke_exited_with(result, ExitCode.UNEXPECTED_ERROR)
     assert result.exception is None or isinstance(result.exception, SystemExit)
     assert "unexpected error" in result.output
+    assert not Path("home/.aws/credentials").exists()
 
 
 def test_api_auth_error_exits_authentication(
@@ -655,29 +674,29 @@ def test_plant_applies_every_live_deployment_whatever_the_type(
 # --- kubeconfig failure paths through the CLI -------------------------------------------
 
 
-def test_kubeconfig_delete_without_token_is_reported_failed(
+def test_kubeconfig_delete_without_token_blocks_the_group(
     cli_fs_runner: CliRunner, monkeypatch
 ) -> None:
     # The server always ships the token on delete; a payload without it cannot be applied
-    # safely and must surface as a failure, not be silently confirmed removed.
+    # safely. Under all-or-nothing placement it blocks the plan: no writes AND no
+    # placement confirmations (nothing was attempted).
     mock = _install_mock(monkeypatch)
     deployment = _kube_deployment(
         "delete", dep_id="dep-k", subdomain="abc123", bearer="s3cret"
     )
     del deployment["token"]
     mock.add_GET(ENDPOINT, create_json_response({"deployments": [deployment]}))
-    mock.add_request(
-        ExpectedRequest("PATCH", f"{ENDPOINT}/dep-k", create_json_response({}, 200))
-    )
 
     result = cli_fs_runner.invoke(
         cli, ["honeytoken", "plant", "--remove-only", "--user-dir", "home"]
     )
 
     assert_invoke_exited_with(result, ExitCode.UNEXPECTED_ERROR)
+    # Only the GET happened; no PATCH confirmation was sent.
     mock.assert_all_requests_happened()
     assert "missing its kubeconfig identity" in result.output
-    assert "1 failure(s)" in result.output
+    assert "blocking problem" in result.output
+    assert not Path("home/.kube/config").exists()
 
 
 def test_kubeconfig_foreign_token_on_delete_is_kept_but_confirmed_removed(
@@ -771,19 +790,106 @@ def test_kubeconfig_foreign_entry_without_force_is_a_clean_refusal(
     assert "real-admin-token" in (kube_dir / "config").read_text(encoding="utf-8")
 
 
-def test_ownership_failure_after_write_is_a_deployment_failure(
+def test_publish_failure_aborts_and_rolls_back(
     cli_fs_runner: CliRunner, monkeypatch
 ) -> None:
-    # apply_dir_perms_and_owner raising (e.g. chown refused as root) must mark that
-    # deployment FAILED and let the run finish, not crash it.
-    from ggshield.verticals.honeytoken.secure_file import SecureFileError
+    # Two new files in one group: the first publish succeeds, the second fails. The
+    # atomic commit must roll the first file back to its planned baseline (absent here)
+    # and report the abort — no placement confirmation is sent for a partial group.
+    from ggshield.verticals.honeytoken import secure_file
 
-    def _refuse(path, target, running_as_root):
-        raise SecureFileError("could not hand back ownership")
+    real_write = secure_file.atomic_write_via_fd
+    calls = {"n": 0}
 
-    monkeypatch.setattr(
-        "ggshield.cmd.honeytoken.plant.apply_dir_perms_and_owner", _refuse
+    def _fail_second(dir_fd, name, content, owner=None):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("disk full")
+        return real_write(dir_fd, name, content, owner)
+
+    monkeypatch.setattr(secure_file, "atomic_write_via_fd", _fail_second)
+
+    mock = _install_mock(monkeypatch)
+    mock.add_POST(
+        ENDPOINT,
+        create_json_response(
+            {
+                "deployments": [
+                    _deployment("write", dep_id="dep-a", token=("AKIAEXAMPLE", "s3")),
+                    _kube_deployment(
+                        "write", dep_id="dep-k", subdomain="abc123", bearer="s3cret"
+                    ),
+                ]
+            }
+        ),
     )
+
+    result = cli_fs_runner.invoke(
+        cli, ["honeytoken", "plant", "--type", "kubeconfig", "--user-dir", "home"]
+    )
+
+    assert_invoke_exited_with(result, ExitCode.UNEXPECTED_ERROR)
+    assert "disk full" in result.output
+    assert "rolled back" in result.output
+    # Nothing survives: the file published first was restored to absent, and the
+    # directories the commit created for the group are gone too.
+    assert not Path("home/.aws/credentials").exists()
+    assert not Path("home/.kube/config").exists()
+    assert not Path("home/.aws").exists()
+    assert not Path("home/.kube").exists()
+
+
+def test_unknown_method_on_write_says_client_may_be_out_of_date(
+    cli_fs_runner: CliRunner, monkeypatch
+) -> None:
+    mock = _install_mock(monkeypatch)
+    deployment = _deployment("write", token=("AKIAEXAMPLE", "s3"))
+    deployment["method"] = "teleport_profile"
+    mock.add_POST(ENDPOINT, create_json_response({"deployments": [deployment]}))
+
+    result = cli_fs_runner.invoke(cli, ["honeytoken", "plant", "--user-dir", "home"])
+
+    assert_invoke_exited_with(result, ExitCode.UNEXPECTED_ERROR)
+    assert "client may be out of date" in result.output
+    assert "missing credentials" not in result.output
+    # A blocked group sends no confirmations and writes nothing.
+    mock.assert_all_requests_happened()
+    assert not Path("home/.aws/credentials").exists()
+
+
+# --- plan-first, all-or-nothing placement -----------------------------------------
+
+
+def test_plan_dry_run_writes_nothing_and_shows_account_identity(
+    cli_fs_runner: CliRunner, monkeypatch
+) -> None:
+    mock = _install_mock(monkeypatch)
+    mock.add_POST(
+        ENDPOINT,
+        create_json_response(
+            {"deployments": [_deployment("write", token=("AKIAEXAMPLE", "s3cr3t"))]}
+        ),
+    )
+
+    result = cli_fs_runner.invoke(
+        cli, ["honeytoken", "plant", "--plan", "--user-dir", "home"]
+    )
+
+    assert_invoke_ok(result)
+    # Only the reconcile POST happened: no disk write, no placement confirmation.
+    mock.assert_all_requests_happened()
+    assert not Path("home/.aws/credentials").exists()
+    # The plan names the account/profile the decoy belongs to (key id, never secret).
+    assert "Placement plan" in result.output
+    assert "aws profile [prod-backup]" in result.output
+    assert "access key id AKIAEXAMPLE" in result.output
+    assert "s3cr3t" not in result.output
+    assert "1 to write" in result.output
+
+
+def test_plan_dry_run_shows_kube_cluster_identity(
+    cli_fs_runner: CliRunner, monkeypatch
+) -> None:
     mock = _install_mock(monkeypatch)
     mock.add_POST(
         ENDPOINT,
@@ -797,8 +903,136 @@ def test_ownership_failure_after_write_is_a_deployment_failure(
             }
         ),
     )
-    mock.add_request(
-        ExpectedRequest("PATCH", f"{ENDPOINT}/dep-k", create_json_response({}, 200))
+
+    result = cli_fs_runner.invoke(
+        cli,
+        [
+            "honeytoken",
+            "plant",
+            "--plan",
+            "--type",
+            "kubeconfig",
+            "--method",
+            "kubeconfig",
+            "--user-dir",
+            "home",
+        ],
+    )
+
+    assert_invoke_ok(result)
+    mock.assert_all_requests_happened()
+    assert not Path("home/.kube/config").exists()
+    # Which cluster/context/user the decoy belongs to (no bearer leaked).
+    assert "kubeconfig context [kubernetes-admin-abc123@abc123]" in result.output
+    assert "cluster [abc123] (https://abc123.orionfleet.io)" in result.output
+    assert "user [kubernetes-admin-abc123]" in result.output
+    assert "s3cret" not in result.output
+
+
+def test_plan_lists_other_identities_sharing_the_file(
+    cli_fs_runner: CliRunner, monkeypatch
+) -> None:
+    # The operator's real profile already lives in the target file: the plan says so.
+    aws_dir = Path("home/.aws")
+    aws_dir.mkdir(parents=True)
+    parser = configparser.ConfigParser(interpolation=None)
+    parser["default"] = {
+        "aws_access_key_id": "USER_OWN",
+        "aws_secret_access_key": "mine",
+    }
+    with open(aws_dir / "credentials", "w") as handle:
+        parser.write(handle)
+
+    mock = _install_mock(monkeypatch)
+    mock.add_POST(
+        ENDPOINT,
+        create_json_response(
+            {"deployments": [_deployment("write", token=("AKIAEXAMPLE", "s3cr3t"))]}
+        ),
+    )
+
+    result = cli_fs_runner.invoke(
+        cli, ["honeytoken", "plant", "--plan", "--user-dir", "home"]
+    )
+
+    assert_invoke_ok(result)
+    assert "file also holds: profile [default]" in result.output
+
+
+def test_plan_blocked_exits_nonzero_without_writing(
+    cli_fs_runner: CliRunner, monkeypatch
+) -> None:
+    aws_dir = Path("home/.aws")
+    aws_dir.mkdir(parents=True)
+    parser = configparser.ConfigParser(interpolation=None)
+    parser["prod-backup"] = {
+        "aws_access_key_id": "USER_OWN",
+        "aws_secret_access_key": "mine",
+    }
+    with open(aws_dir / "credentials", "w") as handle:
+        parser.write(handle)
+
+    mock = _install_mock(monkeypatch)
+    mock.add_POST(
+        ENDPOINT,
+        create_json_response(
+            {"deployments": [_deployment("write", token=("AKIAEXAMPLE", "s3cr3t"))]}
+        ),
+    )
+
+    result = cli_fs_runner.invoke(
+        cli, ["honeytoken", "plant", "--plan", "--user-dir", "home"]
+    )
+
+    assert_invoke_exited_with(result, ExitCode.UNEXPECTED_ERROR)
+    mock.assert_all_requests_happened()
+    assert "BLOCKED" in result.output
+    assert "blocking problem" in result.output
+    # The foreign profile is exactly as it was.
+    assert (
+        _section(aws_dir / "credentials", "prod-backup")["aws_access_key_id"]
+        == "USER_OWN"
+    )
+
+
+def test_conflict_on_second_file_leaves_first_file_untouched(
+    cli_fs_runner: CliRunner, monkeypatch
+) -> None:
+    # The story from the issue: the AWS profile would plant fine, but the kubeconfig
+    # target holds someone else's identity. Nothing must land anywhere.
+    kube_dir = Path("home/.kube")
+    kube_dir.mkdir(parents=True)
+    (kube_dir / "config").write_text(
+        yaml.safe_dump(
+            {
+                "apiVersion": "v1",
+                "kind": "Config",
+                "clusters": [],
+                "users": [
+                    {
+                        "name": "kubernetes-admin-abc123",
+                        "user": {"token": "real-admin-token"},
+                    }
+                ],
+                "contexts": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    mock = _install_mock(monkeypatch)
+    mock.add_POST(
+        ENDPOINT,
+        create_json_response(
+            {
+                "deployments": [
+                    _deployment("write", dep_id="dep-a", token=("AKIAEXAMPLE", "s3")),
+                    _kube_deployment(
+                        "write", dep_id="dep-k", subdomain="abc123", bearer="s3cret"
+                    ),
+                ]
+            }
+        ),
     )
 
     result = cli_fs_runner.invoke(
@@ -806,23 +1040,219 @@ def test_ownership_failure_after_write_is_a_deployment_failure(
     )
 
     assert_invoke_exited_with(result, ExitCode.UNEXPECTED_ERROR)
-    assert "could not hand back ownership" in result.output
-    assert "1 failure(s)" in result.output
+    assert "blocking problem" in result.output
+    # No half group: the healthy target was never written either.
+    assert not Path("home/.aws/credentials").exists()
+    assert "real-admin-token" in (kube_dir / "config").read_text(encoding="utf-8")
+    assert "s3cret" not in (kube_dir / "config").read_text(encoding="utf-8")
+    # No placement confirmations for an aborted group.
+    mock.assert_all_requests_happened()
 
 
-def test_unknown_method_on_write_says_client_may_be_out_of_date(
+def test_file_changed_after_plan_aborts_before_publishing(
     cli_fs_runner: CliRunner, monkeypatch
 ) -> None:
+    # The kubeconfig is hand-edited in the window between planning and the commit's
+    # verify step: the whole group stops, and the healthy AWS file never lands.
+    from ggshield.verticals.honeytoken import secure_file
+
+    # The file exists at plan time with an unrelated, real context; the plan merges
+    # our decoy beside it.
+    kube_dir = Path("home/.kube")
+    kube_dir.mkdir(parents=True)
+    (kube_dir / "config").write_text(
+        yaml.safe_dump(
+            {
+                "apiVersion": "v1",
+                "kind": "Config",
+                "clusters": [
+                    {"name": "real", "cluster": {"server": "https://real.example"}}
+                ],
+                "users": [{"name": "real-user", "user": {"token": "real-token"}}],
+                "contexts": [
+                    {
+                        "name": "real-user@real",
+                        "context": {"cluster": "real", "user": "real-user"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    real_read = secure_file.read_via_fd
+    reads: Dict[str, int] = {}
+
+    def _read_tracking(dir_fd, name):
+        reads[name] = reads.get(name, 0) + 1
+        if name == "config" and reads[name] == 2:
+            # Second read is the commit-time verification: someone swapped the file.
+            return "apiVersion: v1\nkind: Config\n# hand edited after the plan\n"
+        return real_read(dir_fd, name)
+
+    monkeypatch.setattr(secure_file, "read_via_fd", _read_tracking)
+
     mock = _install_mock(monkeypatch)
-    deployment = _deployment("write", token=("AKIAEXAMPLE", "s3"))
-    deployment["method"] = "teleport_profile"
-    mock.add_POST(ENDPOINT, create_json_response({"deployments": [deployment]}))
+    mock.add_POST(
+        ENDPOINT,
+        create_json_response(
+            {
+                "deployments": [
+                    _deployment("write", dep_id="dep-a", token=("AKIAEXAMPLE", "s3")),
+                    _kube_deployment(
+                        "write", dep_id="dep-k", subdomain="abc123", bearer="s3cret"
+                    ),
+                ]
+            }
+        ),
+    )
+
+    result = cli_fs_runner.invoke(
+        cli, ["honeytoken", "plant", "--type", "kubeconfig", "--user-dir", "home"]
+    )
+
+    assert_invoke_exited_with(result, ExitCode.UNEXPECTED_ERROR)
+    assert "changed since the plan was reviewed" in result.output
+    assert not Path("home/.aws/credentials").exists()
+    # The directory the aborting commit pre-created for the healthy AWS target is
+    # removed too: the machine is byte-for-byte as it was.
+    assert not Path("home/.aws").exists()
+    # The existing kubeconfig was neither merged into nor overwritten.
+    assert kube_dir.exists()
+    kube_text = (kube_dir / "config").read_text(encoding="utf-8")
+    assert "real-token" in kube_text
+    assert "abc123" not in kube_text
+    mock.assert_all_requests_happened()
+
+
+def test_confirmation_prompt_decline_writes_nothing(
+    cli_fs_runner: CliRunner, monkeypatch
+) -> None:
+    monkeypatch.setattr("ggshield.cmd.honeytoken.plant._is_interactive", lambda: True)
+    mock = _install_mock(monkeypatch)
+    mock.add_POST(
+        ENDPOINT,
+        create_json_response(
+            {"deployments": [_deployment("write", token=("AKIAEXAMPLE", "s3cr3t"))]}
+        ),
+    )
+
+    result = cli_fs_runner.invoke(
+        cli, ["honeytoken", "plant", "--user-dir", "home"], input="n\n"
+    )
+
+    assert_invoke_ok(result)
+    assert "Aborted; no files were changed" in result.output
+    assert not Path("home/.aws/credentials").exists()
+    mock.assert_all_requests_happened()
+
+
+def test_confirmation_prompt_accept_commits(
+    cli_fs_runner: CliRunner, monkeypatch
+) -> None:
+    monkeypatch.setattr("ggshield.cmd.honeytoken.plant._is_interactive", lambda: True)
+    mock = _install_mock(monkeypatch)
+    mock.add_POST(
+        ENDPOINT,
+        create_json_response(
+            {"deployments": [_deployment("write", token=("AKIAEXAMPLE", "s3cr3t"))]}
+        ),
+    )
     mock.add_request(
         ExpectedRequest("PATCH", f"{ENDPOINT}/dep-1", create_json_response({}, 200))
     )
 
-    result = cli_fs_runner.invoke(cli, ["honeytoken", "plant", "--user-dir", "home"])
+    result = cli_fs_runner.invoke(
+        cli, ["honeytoken", "plant", "--user-dir", "home"], input="y\n"
+    )
 
-    assert_invoke_exited_with(result, ExitCode.UNEXPECTED_ERROR)
-    assert "client may be out of date" in result.output
-    assert "missing credentials" not in result.output
+    assert_invoke_ok(result)
+    mock.assert_all_requests_happened()
+    assert Path("home/.aws/credentials").exists()
+
+
+def test_yes_skips_prompt_and_commits(cli_fs_runner: CliRunner, monkeypatch) -> None:
+    # Even when stdin is a TTY, --yes commits the reviewed plan without asking.
+    monkeypatch.setattr("ggshield.cmd.honeytoken.plant._is_interactive", lambda: True)
+    mock = _install_mock(monkeypatch)
+    mock.add_POST(
+        ENDPOINT,
+        create_json_response(
+            {"deployments": [_deployment("write", token=("AKIAEXAMPLE", "s3cr3t"))]}
+        ),
+    )
+    mock.add_request(
+        ExpectedRequest("PATCH", f"{ENDPOINT}/dep-1", create_json_response({}, 200))
+    )
+
+    result = cli_fs_runner.invoke(
+        cli, ["honeytoken", "plant", "--yes", "--user-dir", "home"]
+    )
+
+    assert_invoke_ok(result)
+    mock.assert_all_requests_happened()
+    assert Path("home/.aws/credentials").exists()
+
+
+def test_running_twice_plants_no_second_copy(
+    cli_fs_runner: CliRunner, monkeypatch
+) -> None:
+    def _one_response():
+        mock = _install_mock(monkeypatch)
+        mock.add_POST(
+            ENDPOINT,
+            create_json_response(
+                {"deployments": [_deployment("write", token=("AKIAEXAMPLE", "s3cr3t"))]}
+            ),
+        )
+        mock.add_request(
+            ExpectedRequest("PATCH", f"{ENDPOINT}/dep-1", create_json_response({}, 200))
+        )
+        return mock
+
+    first = _one_response()
+    result = cli_fs_runner.invoke(cli, ["honeytoken", "plant", "--user-dir", "home"])
+    assert_invoke_ok(result)
+    first.assert_all_requests_happened()
+    assert "1 written, 0 skipped" in result.output
+    after_first = Path("home/.aws/credentials").read_text()
+
+    second = _one_response()
+    result = cli_fs_runner.invoke(cli, ["honeytoken", "plant", "--user-dir", "home"])
+    assert_invoke_ok(result)
+    second.assert_all_requests_happened()
+    assert "0 written, 1 skipped" in result.output
+    # The second run changed nothing on disk.
+    assert Path("home/.aws/credentials").read_text() == after_first
+
+
+def test_plan_remove_only_shows_remove_without_touching_disk(
+    cli_fs_runner: CliRunner, monkeypatch
+) -> None:
+    aws_dir = Path("home/.aws")
+    aws_dir.mkdir(parents=True)
+    parser = configparser.ConfigParser(interpolation=None)
+    parser["prod-backup"] = {
+        "aws_access_key_id": "REVOKED",
+        "aws_secret_access_key": "old",
+    }
+    with open(aws_dir / "credentials", "w") as handle:
+        parser.write(handle)
+
+    mock = _install_mock(monkeypatch)
+    mock.add_GET(
+        ENDPOINT,
+        create_json_response(
+            {"deployments": [_deployment("delete", token=("REVOKED", "old"))]}
+        ),
+    )
+
+    result = cli_fs_runner.invoke(
+        cli, ["honeytoken", "plant", "--plan", "--remove-only", "--user-dir", "home"]
+    )
+
+    assert_invoke_ok(result)
+    mock.assert_all_requests_happened()
+    assert "[remove]" in result.output
+    # Dry run: the revoked profile is still on disk.
+    assert _section(aws_dir / "credentials", "prod-backup") is not None

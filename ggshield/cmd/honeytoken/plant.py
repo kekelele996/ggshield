@@ -1,6 +1,7 @@
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import click
 
@@ -8,99 +9,47 @@ from ggshield.cmd.utils.common_options import add_common_options
 from ggshield.cmd.utils.context_obj import ContextObj
 from ggshield.core.client import create_client_from_config
 from ggshield.core.errors import ExitCode
-from ggshield.verticals.honeytoken.aws_profile import (
-    remove_aws_profile,
-    resolve_placement,
-    write_aws_profile,
-)
 from ggshield.verticals.honeytoken.endpoint_deployments import (
     ConfirmStatus,
     Deployment,
     DeploymentAction,
-    DeploymentMethod,
     EndpointDeploymentsClient,
     EndpointDeploymentsError,
-    HoneytokenCreds,
-    KubeconfigToken,
 )
-from ggshield.verticals.honeytoken.kubeconfig_file import (
-    kube_path,
-    remove_kubeconfig,
-    write_kubeconfig,
+from ggshield.verticals.honeytoken.staging import (
+    CommitAborted,
+    Plan,
+    PlanStatus,
+    UserPlan,
+    build_user_plan,
+    commit_plan,
+    format_plan,
 )
-from ggshield.verticals.honeytoken.placement import (
-    ForceRefusal,
-    PlacementError,
-    RemoveOutcome,
-    WriteOutcome,
-)
-from ggshield.verticals.honeytoken.secure_file import Ownership
 from ggshield.verticals.honeytoken.targets import (
     Target,
-    apply_dir_perms_and_owner,
     is_root,
     machine_info_for,
-    ownership_for,
     resolve_targets,
 )
 
 
 @dataclass
 class _Outcome:
-    """Per-target reconciliation result, aggregated into the final exit code."""
+    """Per-run reconciliation result, aggregated into the final exit code."""
 
     api_failure: bool = False
     api_auth_failure: bool = False
     fs_failure: bool = False
 
 
-_AWS_METHODS = (
-    DeploymentMethod.AWS_CREDENTIALS,
-    DeploymentMethod.AWS_CONFIG_PROFILE,
-)
-
-
-def _apply_write(
-    item: Deployment, home: Path, force: bool, owner: Optional[Ownership]
-) -> Tuple[Path, WriteOutcome]:
-    """Materialize a ``write`` on disk, dispatching on the placement method. ``owner``
-    is who the file must belong to once written. Returns the written path (for the
-    directory fix-up) and the outcome."""
-    if item.method in _AWS_METHODS:
-        if not isinstance(item.token, HoneytokenCreds):
-            raise PlacementError("aws deployment is missing its credentials")
-        path, section = resolve_placement(item.method, item.config, home)
-        return path, write_aws_profile(path, section, item.token, force, owner)
-    if item.method is DeploymentMethod.KUBECONFIG:
-        if not isinstance(item.token, KubeconfigToken):
-            raise PlacementError("kubeconfig deployment is missing its kubeconfig")
-        path = kube_path(home, item.config.filename)
-        return path, write_kubeconfig(path, item.token, force, owner)
-    raise PlacementError("unsupported deployment method — client may be out of date")
-
-
-def _apply_remove(
-    item: Deployment, home: Path, owner: Optional[Ownership]
-) -> Tuple[Path, RemoveOutcome]:
-    """Remove a deployment from disk, dispatching on the placement method. ``owner``
-    applies when the removal rewrites the file. Returns the path (for the directory
-    fix-up) and the outcome."""
-    if item.method in _AWS_METHODS:
-        path, section = resolve_placement(item.method, item.config, home)
-        expected = (
-            item.token.access_token_id
-            if isinstance(item.token, HoneytokenCreds)
-            else None
-        )
-        return path, remove_aws_profile(path, section, expected, owner)
-    if item.method is DeploymentMethod.KUBECONFIG:
-        # The server always ships the token on `delete` too (the identity — context,
-        # cluster, user — lives in it); without it there is nothing safe to remove.
-        if not isinstance(item.token, KubeconfigToken):
-            raise PlacementError("kubeconfig delete is missing its kubeconfig identity")
-        path = kube_path(home, item.config.filename)
-        return path, remove_kubeconfig(path, item.token, owner)
-    raise PlacementError("unsupported deployment method — client may be out of date")
+def _is_interactive() -> bool:
+    """Whether to ask for confirmation before committing. Agents/CI (pipes, the test
+    runner, a non-TTY stdin) apply directly; an operator at a terminal reviews the plan
+    and confirms first. ``--yes`` skips the prompt explicitly."""
+    try:
+        return bool(sys.stdin is not None and sys.stdin.isatty())
+    except Exception:  # noqa: BLE001 - a closed/replaced stdin must not crash the run
+        return False
 
 
 @click.command()
@@ -153,6 +102,21 @@ def _apply_remove(
     help="Print the resolved planting targets and exit (no API call, no disk writes).",
 )
 @click.option(
+    "--plan",
+    "plan_only",
+    is_flag=True,
+    help="Check every target and print the placement plan — with the account/profile or "
+    "cluster/context each entry belongs to — then exit. No disk writes and no placement "
+    "confirmations; exits non-zero if any target conflicts.",
+)
+@click.option(
+    "--yes",
+    "-y",
+    "assume_yes",
+    is_flag=True,
+    help="Apply the plan without the confirmation prompt (non-interactive runs).",
+)
+@click.option(
     "--remove-only",
     "remove_only",
     is_flag=True,
@@ -170,18 +134,27 @@ def plant_cmd(
     user_dir: Optional[Path],
     force: bool,
     list_targets: bool,
+    plan_only: bool,
+    assume_yes: bool,
     remove_only: bool,
     **kwargs: Any,
 ) -> int:
     """
     Detect endpoint intrusion by planting a honeytoken on this machine.
 
-    Honeytokens deployed are fully synchronized with the GitGuardian platform.
-    Apply the desired on-disk state: write/refresh the decoy for `write` entries
-    (an AWS credentials profile under `~/.aws/`, or a kubeconfig context under
-    `~/.kube/`), remove it for `delete` (revoked) entries — preserving any other
-    profiles/contexts the user already has. ggshield never revokes a honeytoken;
-    it only reports placement status.
+    Placement is two-phase: every target file is checked read-only first and the full
+    placement plan is shown (which AWS profile/access key or kubeconfig cluster/context
+    lands in which file, alongside the identities already sharing it). On confirmation
+    the whole plan is committed at once: if any target conflicts, is unreadable, or
+    changes between the plan and the commit, nothing is written and earlier files are
+    rolled back — a run never lands half a group. Re-running the command finds entries
+    already in place and never plants a second copy.
+
+    Honeytokens deployed are fully synchronized with the GitGuardian platform:
+    write/refresh the decoy for `write` entries (an AWS credentials profile under
+    `~/.aws/`, or a kubeconfig context under `~/.kube/`), remove it for `delete`
+    (revoked) entries, preserving any other profiles/contexts the user already has.
+    ggshield never revokes a honeytoken; it only reports placement status.
 
     Authorize with the `honeytokens:write` scope.
     """
@@ -212,196 +185,165 @@ def plant_cmd(
     )
     running_as_root = is_root()
 
+    # Phase 0: fetch the desired state for EVERY user first. An API failure for one
+    # target aborts the run before any file is considered, instead of planting for the
+    # users that responded.
     final = _Outcome()
+    fetched: List[Tuple[Target, List[Deployment]]] = []
     for target in targets:
         try:
-            outcome = _reconcile_for_user(
-                client,
-                target,
-                token_type=token_type,
-                method=method,
-                filename=filename,
-                profile_name=profile_name,
-                force=force,
-                remove_only=remove_only,
-                running_as_root=running_as_root,
-            )
-        except Exception as exc:  # noqa: BLE001 - one target must not abort the run
-            # Per-deployment errors are handled inside _reconcile_for_user; this is the
-            # last-resort net so an unexpected failure for one user (esp. in a root
-            # fan-out) doesn't skip the remaining users.
-            click.echo(f"[{target.username}] unexpected error: {exc}", err=True)
-            final.fs_failure = True
+            if remove_only:
+                deployments = client.list(
+                    machine_info_for(target.username)["machine_id"], target.username
+                )
+            else:
+                deployments = client.reconcile(
+                    machine_info_for(target.username),
+                    token_type,
+                    method=method,
+                    filename=filename,
+                    profile_name=profile_name,
+                )
+        except EndpointDeploymentsError as exc:
+            click.echo(f"[{target.username}] {exc}", err=True)
+            final.api_failure = True
+            final.api_auth_failure = exc.is_auth
             continue
-        final.api_failure |= outcome.api_failure
-        final.api_auth_failure |= outcome.api_auth_failure
-        final.fs_failure |= outcome.fs_failure
+        fetched.append((target, deployments))
 
     if final.api_auth_failure:
         return ExitCode.AUTHENTICATION_ERROR
-    if final.api_failure or final.fs_failure:
+    if final.api_failure:
+        click.echo(
+            "Placement aborted: could not fetch the desired state for every target, "
+            "so no files were changed.",
+            err=True,
+        )
+        return ExitCode.UNEXPECTED_ERROR
+
+    # Phase 1: plan — read-only staging for the whole group, all problems collected.
+    plan = Plan()
+    for target, deployments in fetched:
+        try:
+            user_plan = build_user_plan(
+                target,
+                deployments,
+                force=force,
+                running_as_root=running_as_root,
+                remove_only=remove_only,
+            )
+        except Exception as exc:  # noqa: BLE001 - never crash planning a target
+            click.echo(f"[{target.username}] unexpected error: {exc}", err=True)
+            final.fs_failure = True
+            continue
+        plan.users.append(user_plan)
+    if final.fs_failure:
+        click.echo(
+            "Placement aborted: planning failed for at least one target, so no files "
+            "were changed.",
+            err=True,
+        )
+        return ExitCode.UNEXPECTED_ERROR
+
+    click.echo(format_plan(plan, dry_run=plan_only))
+
+    if plan_only:
+        return ExitCode.UNEXPECTED_ERROR if plan.has_blockers else ExitCode.SUCCESS
+
+    if plan.has_blockers:
+        click.echo(
+            "Placement aborted: resolve the blocking problem(s) above "
+            "(or re-run with --force for a same-named foreign entry); no files were "
+            "changed.",
+            err=True,
+        )
+        return ExitCode.UNEXPECTED_ERROR
+
+    # Phase 2 gate: an interactive operator confirms the reviewed plan; non-interactive
+    # runs (agents, pipes) and --yes skip the prompt.
+    if plan.has_changes and not assume_yes and _is_interactive():
+        if not click.confirm("\nProceed with this placement?", default=False):
+            click.echo("Aborted; no files were changed.")
+            return ExitCode.SUCCESS
+
+    # Phase 2: one atomic commit for the entire group.
+    try:
+        commit_plan(plan, running_as_root=running_as_root)
+    except CommitAborted as exc:
+        for reason in exc.reasons:
+            click.echo(reason, err=True)
+        click.echo(
+            "Placement aborted and any partial changes were rolled back: every target "
+            "is back as it was.",
+            err=True,
+        )
+        return ExitCode.UNEXPECTED_ERROR
+
+    # Only after the group landed do we report outcomes to the platform.
+    for user_plan in plan.users:
+        for notice in user_plan.notices:
+            click.echo(f"[{user_plan.target.username}] {notice}", err=True)
+        _confirm_all(client, user_plan)
+        final.fs_failure |= _summarize(user_plan)
+
+    if final.fs_failure:
         return ExitCode.UNEXPECTED_ERROR
     return ExitCode.SUCCESS
 
 
-def _reconcile_for_user(
-    client: EndpointDeploymentsClient,
-    target: Target,
-    *,
-    token_type: str,
-    method: Optional[str],
-    filename: Optional[str],
-    profile_name: Optional[str],
-    force: bool,
-    remove_only: bool,
-    running_as_root: bool,
-) -> _Outcome:
-    outcome = _Outcome()
-    try:
-        if remove_only:
-            deployments = client.list(
-                machine_info_for(target.username)["machine_id"], target.username
-            )
+def _confirm_all(client: EndpointDeploymentsClient, user_plan: UserPlan) -> None:
+    """Report outcomes for every staged deployment. A failed confirm is logged, not
+    fatal — the next reconcile re-syncs; the atomic commit already guarantees the
+    on-disk state itself."""
+    for entry in user_plan.entries:
+        if entry.blocked:
+            # Blocked entries never reach this point (the run aborts before commit),
+            # but keep the guard explicit.
+            continue
+        if entry.deployment.action is DeploymentAction.DELETE:
+            # All three remove outcomes mean the revoked decoy no longer occupies its
+            # entry on disk (see the backend's verify-before-remove), including a
+            # foreign entry reusing our name.
+            status = ConfirmStatus.REMOVED
         else:
-            deployments = client.reconcile(
-                machine_info_for(target.username),
-                token_type,
-                method=method,
-                filename=filename,
-                profile_name=profile_name,
-            )
-    except EndpointDeploymentsError as exc:
-        click.echo(f"[{target.username}] {exc}", err=True)
-        outcome.api_failure = True
-        outcome.api_auth_failure = exc.is_auth
-        return outcome
-
-    owner = ownership_for(target, running_as_root)
-    written = skipped = removed = force_refused = other_failed = 0
-
-    # Pass 1: deletes first so a rotation (delete-old + write-new in the same response)
-    # frees the profile slot before the write runs.
-    for item in (d for d in deployments if d.action is DeploymentAction.DELETE):
+            status = ConfirmStatus.PLANTED
         try:
-            path, result = _apply_remove(item, target.home, owner)
-            if result is RemoveOutcome.FOREIGN_KEPT:
-                # The entry is still there but no longer holds *our* token, so the
-                # revoked decoy is gone from disk — which is what `removed` means to
-                # the server. Reporting a failure instead never clears: a rotation
-                # whose confirm was lost leaves the delete pending against an entry the
-                # write has already refreshed, and every later run fails on it again.
-                click.echo(
-                    f"[{target.username}] deployment {item.id}: entry holds a "
-                    "different token, left untouched",
-                    err=True,
-                )
-                _confirm(client, item, ConfirmStatus.REMOVED, target)
-                removed += 1
-                continue
-            if result is RemoveOutcome.REMOVED and path.exists():
-                # The removal rewrote the file (other entries remain); the write
-                # path already handed it back to the target. Keep the placement dir
-                # itself private and theirs.
-                apply_dir_perms_and_owner(path, target, running_as_root)
-            _confirm(client, item, ConfirmStatus.REMOVED, target)
-            removed += 1
-        except Exception as exc:  # noqa: BLE001 - report + continue per deployment
-            click.echo(f"[{target.username}] {exc}", err=True)
-            _confirm(client, item, ConfirmStatus.FAILED, target)
-            other_failed += 1
-
-    # Pass 2: writes — suppressed in --remove-only mode.
-    write_items = (
-        []
-        if remove_only
-        else [d for d in deployments if d.action is DeploymentAction.WRITE]
-    )
-    for item in write_items:
-        if item.method is DeploymentMethod.UNKNOWN:
-            # A newer backend's placement method: say so, rather than blaming the
-            # payload (its token is unparsed, not missing).
+            client.confirm(entry.deployment.id, status)
+        except EndpointDeploymentsError as exc:
             click.echo(
-                f"[{target.username}] deployment {item.id}: unsupported deployment "
-                "method — client may be out of date",
+                f"[{user_plan.target.username}] could not confirm deployment "
+                f"{entry.deployment.id} as {status.value}: {exc}",
                 err=True,
             )
-            _confirm(client, item, ConfirmStatus.FAILED, target)
-            other_failed += 1
-            continue
-        if item.token is None:
-            click.echo(
-                f"[{target.username}] 'write' entry missing credentials", err=True
-            )
-            _confirm(client, item, ConfirmStatus.FAILED, target)
-            other_failed += 1
-            continue
-        try:
-            path, result = _apply_write(item, target.home, force, owner)
-            if result is WriteOutcome.WROTE:
-                apply_dir_perms_and_owner(path, target, running_as_root)
-                _confirm(client, item, ConfirmStatus.PLANTED, target)
-                written += 1
-            else:  # ALREADY_CURRENT
-                _confirm(client, item, ConfirmStatus.PLANTED, target)
-                skipped += 1
-        except ForceRefusal as exc:
-            click.echo(f"[{target.username}] {exc}", err=True)
-            _confirm(client, item, ConfirmStatus.FAILED, target)
-            force_refused += 1
-        except Exception as exc:  # noqa: BLE001 - report + continue per deployment
-            # Includes PlacementError (e.g. a malformed ~/.aws file), OSError, and any
-            # unexpected error: a fleet agent must never crash mid-run — report this
-            # deployment as failed (the server retries on the next sync) and continue.
-            click.echo(f"[{target.username}] {exc}", err=True)
-            _confirm(client, item, ConfirmStatus.FAILED, target)
-            other_failed += 1
 
-    # Forward-compat: log (don't crash on) actions a newer backend introduced.
-    for item in (d for d in deployments if d.action is DeploymentAction.UNKNOWN):
-        click.echo(
-            f"[{target.username}] ignoring unknown action for deployment {item.id} "
-            "— client may be out of date",
-            err=True,
-        )
 
-    suppressed = (
-        sum(1 for d in deployments if d.action is DeploymentAction.WRITE)
-        if remove_only
-        else 0
+def _summarize(user_plan: UserPlan) -> bool:
+    """Print the same per-user reconciliation summary as before. Returns whether any
+    non-fatal filesystem problem remains (kept for exit-code aggregation)."""
+    written = sum(1 for entry in user_plan.entries if entry.status is PlanStatus.WRITE)
+    skipped = sum(
+        1 for entry in user_plan.entries if entry.status is PlanStatus.ALREADY_CURRENT
+    )
+    removed = sum(
+        1
+        for entry in user_plan.entries
+        if entry.status
+        in (PlanStatus.REMOVE, PlanStatus.ALREADY_ABSENT, PlanStatus.FOREIGN_KEPT)
     )
     suffix = (
-        f" (remove-only: {suppressed} planting action(s) skipped)" if suppressed else ""
+        f" (remove-only: {user_plan.suppressed_writes} planting action(s) skipped)"
+        if user_plan.suppressed_writes
+        else ""
     )
-    total_failed = force_refused + other_failed
-    summary = (
-        f"[{target.username}] reconciled — {written} written, {skipped} skipped, "
-        f"{removed} removed{suffix}"
+    for entry in user_plan.entries:
+        if entry.status is PlanStatus.FOREIGN_KEPT:
+            click.echo(
+                f"[{user_plan.target.username}] deployment {entry.deployment.id}: "
+                "entry holds a different token, left untouched",
+                err=True,
+            )
+    click.echo(
+        f"[{user_plan.target.username}] reconciled — {written} written, {skipped} "
+        f"skipped, {removed} removed{suffix}"
     )
-    if total_failed:
-        click.echo(
-            f"[{target.username}] reconciled with {total_failed} failure(s) "
-            f"({written} written, {skipped} skipped, {removed} removed){suffix}",
-            err=True,
-        )
-        outcome.fs_failure = True
-    else:
-        click.echo(summary)
-    return outcome
-
-
-def _confirm(
-    client: EndpointDeploymentsClient,
-    item: Deployment,
-    status: ConfirmStatus,
-    target: Target,
-) -> None:
-    """Best-effort status confirmation: a failed confirm is logged, not fatal — the next
-    reconcile re-syncs."""
-    try:
-        client.confirm(item.id, status)
-    except EndpointDeploymentsError as exc:
-        click.echo(
-            f"[{target.username}] could not confirm deployment {item.id} as "
-            f"{status.value}: {exc}",
-            err=True,
-        )
+    return False

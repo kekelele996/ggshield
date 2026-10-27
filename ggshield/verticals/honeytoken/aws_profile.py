@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from configupdater import ConfigUpdater
 
@@ -160,6 +160,65 @@ def _decide_remove(
     return RemoveOutcome.REMOVED
 
 
+# --- pure staging (text in, text out — no disk) -----------------------------------
+#
+# The transactional planner (``staging``) needs to know what a write/remove WOULD do
+# without doing it, so it can validate the whole target set before publishing anything.
+# ``None`` content means "no file must be written": either the entry is already current
+# (write), or the file must be unlinked (remove emptied it).
+
+
+def stage_aws_write(
+    text: Optional[str],
+    section: str,
+    creds: HoneytokenCreds,
+    force: bool,
+    path: Path,
+) -> Tuple[WriteOutcome, Optional[str]]:
+    """Decide a write against ``text`` and render the resulting file. Pure: no I/O.
+
+    Returns ``(ALREADY_CURRENT, None)`` or ``(WROTE, <full new file text>)``; refusal/
+    parse problems surface as :class:`ForceRefusal` / :class:`PlacementError`, exactly
+    as :func:`write_aws_profile` would raise on disk.
+    """
+    parser = _parse_text(text, path)
+    outcome = _decide_write(parser, section, creds, force, path)
+    if outcome is not WriteOutcome.WROTE:
+        return outcome, None
+    return outcome, str(parser)
+
+
+def stage_aws_remove(
+    text: Optional[str],
+    section: str,
+    expected_access_key_id: Optional[str],
+    path: Path,
+) -> Tuple[RemoveOutcome, Optional[str]]:
+    """Decide a remove against ``text`` and render the resulting file. Pure: no I/O.
+
+    Returns ``(REMOVED, None)`` when the file must be unlinked (nothing is left),
+    ``(REMOVED, <text>)`` when other profiles/comments survive, and the no-op outcomes
+    with ``None`` unchanged.
+    """
+    parser = _parse_text(text, path)
+    outcome = _decide_remove(parser, section, expected_access_key_id)
+    if outcome is not RemoveOutcome.REMOVED:
+        return outcome, None
+    rendered = str(parser)
+    return outcome, rendered if rendered.strip() else None
+
+
+def summarize_aws(text: Optional[str], path: Path) -> List[str]:
+    """Names of the profiles a file currently holds — the "other identities" the plan
+    shows so an operator can spot a shared/hand-edited credentials file. Names only,
+    never values. A file we can't parse yields nothing (the entry is then blocked)."""
+    try:
+        parser = _parse_text(text, path)
+    except PlacementError:
+        return []
+    return [f"profile [{section}]" for section in parser.sections()]
+
+
 # --- public API -------------------------------------------------------------------
 
 
@@ -180,21 +239,25 @@ def write_aws_profile(
         if secure_file.FD_HARDENED:
             dir_fd = secure_file.open_dir_fd(path.parent, create=True)
             try:
-                parser = _parse_text(secure_file.read_via_fd(dir_fd, path.name), path)
-                outcome = _decide_write(parser, section, creds, force, path)
+                outcome, content = stage_aws_write(
+                    secure_file.read_via_fd(dir_fd, path.name),
+                    section,
+                    creds,
+                    force,
+                    path,
+                )
                 if outcome is WriteOutcome.WROTE:
-                    secure_file.atomic_write_via_fd(
-                        dir_fd, path.name, str(parser), owner
-                    )
+                    secure_file.atomic_write_via_fd(dir_fd, path.name, content, owner)
                 return outcome
             finally:
                 os.close(dir_fd)
 
         secure_file.reject_symlinked_target(path)
-        parser = _parse_text(secure_file.read_path(path), path)
-        outcome = _decide_write(parser, section, creds, force, path)
+        outcome, content = stage_aws_write(
+            secure_file.read_path(path), section, creds, force, path
+        )
         if outcome is WriteOutcome.WROTE:
-            secure_file.atomic_write_path(path, str(parser))
+            secure_file.atomic_write_path(path, content)
         return outcome
     except (SecureFileError, OSError) as exc:
         raise PlacementError(str(exc))
@@ -225,14 +288,13 @@ def remove_aws_profile(
                 text = secure_file.read_via_fd(dir_fd, path.name)
                 if text is None:
                     return RemoveOutcome.ALREADY_ABSENT
-                parser = _parse_text(text, path)
-                outcome = _decide_remove(parser, section, expected_access_key_id)
+                outcome, content = stage_aws_remove(
+                    text, section, expected_access_key_id, path
+                )
                 if outcome is not RemoveOutcome.REMOVED:
                     return outcome
-                if str(parser).strip():
-                    secure_file.atomic_write_via_fd(
-                        dir_fd, path.name, str(parser), owner
-                    )
+                if content is not None:
+                    secure_file.atomic_write_via_fd(dir_fd, path.name, content, owner)
                 else:
                     secure_file.unlink_via_fd(dir_fd, path.name)
                 return outcome
@@ -243,12 +305,11 @@ def remove_aws_profile(
         text = secure_file.read_path(path)
         if text is None:
             return RemoveOutcome.ALREADY_ABSENT
-        parser = _parse_text(text, path)
-        outcome = _decide_remove(parser, section, expected_access_key_id)
+        outcome, content = stage_aws_remove(text, section, expected_access_key_id, path)
         if outcome is not RemoveOutcome.REMOVED:
             return outcome
-        if str(parser).strip():
-            secure_file.atomic_write_path(path, str(parser))
+        if content is not None:
+            secure_file.atomic_write_path(path, content)
         else:
             secure_file.unlink_path(path)
         return outcome
