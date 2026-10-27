@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import ANY, Mock, patch
 
 import pytest
@@ -96,7 +97,7 @@ class TestPrepush:
         THEN it should return 0 warn too many commits for scanning, and scan last 50
         """
         scan_commit_range_mock.return_value = 0
-        get_list_mock.return_value = ["a"] * 51
+        get_list_mock.return_value = [f"{i:040x}" for i in range(51)]
         result = cli_fs_runner.invoke(
             cli,
             ["-v", "secret", "scan", "pre-push"],
@@ -174,6 +175,7 @@ class TestPrepush:
                 endpoint_registration=True,
             ),
             secret_config=ANY,
+            scan_collection_callback=ANY,
         )
         assert_invoke_ok(result)
         assert "Commits to scan: 20" in result.output
@@ -234,7 +236,7 @@ class TestPrepush:
         THEN it should warn of new branch and return 0
         """
         scan_commit_range_mock.return_value = 0
-        get_list_mock.return_value = ["a" for _ in range(60)]
+        get_list_mock.return_value = [f"{i:040x}" for i in range(60)]
 
         result = cli_fs_runner.invoke(
             cli,
@@ -357,6 +359,7 @@ class TestPrepush:
             exclusion_regexes=ANY,
             scan_context=ANY,
             secret_config=ANY,
+            scan_collection_callback=ANY,
         )
 
     @patch("ggshield.cmd.secret.scan.prepush.scan_commit_range")
@@ -396,6 +399,7 @@ class TestPrepush:
             exclusion_regexes=ANY,
             scan_context=ANY,
             secret_config=ANY,
+            scan_collection_callback=ANY,
         )
 
     @patch("ggshield.cmd.secret.scan.prepush.scan_commit_range")
@@ -564,3 +568,232 @@ class TestPrepush:
             env={"PRE_COMMIT_FROM_REF": "a" * 40, "PRE_COMMIT_TO_REF": "b" * 40},
         )
         assert_invoke_exited_with(result, ExitCode.UNEXPECTED_ERROR)
+
+    @patch("ggshield.cmd.secret.scan.prepush.scan_commit_range")
+    def test_prepush_multiple_new_branches_shared_commits_scanned_once(
+        self,
+        scan_commit_range_mock: Mock,
+        tmp_path,
+        cli_fs_runner: CliRunner,
+    ):
+        """
+        GIVEN a push updating two new branches which share commits
+        WHEN the pre-push command is run with two ref updates on stdin
+        THEN every ref update is taken into account
+        AND commits shared by both refs are only scanned once
+        AND the scan result is reported per ref
+        """
+        local_repo = create_local_repo_with_remote(tmp_path)
+
+        local_repo.create_branch("topic-a")
+        shared_shas = [local_repo.create_commit() for _ in range(2)]
+
+        # topic-b starts from topic-a, so it includes the shared commits
+        local_repo.create_branch("topic-b")
+        topic_b_only_sha = local_repo.create_commit()
+
+        scan_commit_range_mock.return_value = 0
+
+        prepush_input = (
+            f"refs/heads/topic-a {shared_shas[-1]} "
+            f"refs/heads/topic-a {EMPTY_SHA}\n"
+            f"refs/heads/topic-b {topic_b_only_sha} "
+            f"refs/heads/topic-b {EMPTY_SHA}\n"
+        )
+        with cd(str(local_repo.path)):
+            result = cli_fs_runner.invoke(
+                cli,
+                ["-v", "secret", "scan", "pre-push", "origin", local_repo.remote_url],
+                input=prepush_input,
+            )
+
+        assert_invoke_ok(result)
+        scan_commit_range_mock.assert_called_once()
+        commit_list = scan_commit_range_mock.call_args.kwargs["commit_list"]
+        assert commit_list == shared_shas + [topic_b_only_sha]
+        assert "refs/heads/topic-a: 2 new commit(s) to scan." in result.output
+        assert "refs/heads/topic-b: 3 new commit(s) to scan." in result.output
+        assert (
+            "refs/heads/topic-a: 2 commit(s) scanned, no secrets found."
+            in result.output
+        )
+        assert (
+            "refs/heads/topic-b: 3 commit(s) scanned, no secrets found."
+            in result.output
+        )
+
+    @patch("ggshield.cmd.secret.scan.prepush.scan_commit_range")
+    def test_prepush_deleted_ref_does_not_hide_following_refs(
+        self,
+        scan_commit_range_mock: Mock,
+        tmp_path,
+        cli_fs_runner: CliRunner,
+    ):
+        """
+        GIVEN a push whose first stdin line is a ref deletion
+        AND whose second line updates a branch with new commits
+        WHEN the pre-push command is run
+        THEN the deletion is reported per ref
+        AND the branch update on the following line is still scanned
+        """
+        local_repo = create_local_repo_with_remote(tmp_path)
+        deleted_ref_sha = local_repo.get_top_sha()
+
+        local_repo.create_branch("topic")
+        new_shas = [local_repo.create_commit() for _ in range(2)]
+
+        scan_commit_range_mock.return_value = 0
+
+        prepush_input = (
+            f"(delete) {EMPTY_SHA} refs/heads/old {deleted_ref_sha}\n"
+            f"refs/heads/topic {new_shas[-1]} refs/heads/topic {EMPTY_SHA}\n"
+        )
+        with cd(str(local_repo.path)):
+            result = cli_fs_runner.invoke(
+                cli,
+                ["-v", "secret", "scan", "pre-push", "origin", local_repo.remote_url],
+                input=prepush_input,
+            )
+
+        assert_invoke_ok(result)
+        scan_commit_range_mock.assert_called_once()
+        commit_list = scan_commit_range_mock.call_args.kwargs["commit_list"]
+        assert commit_list == new_shas
+        assert "refs/heads/old: remote ref deleted, nothing to scan." in result.output
+        assert "refs/heads/topic: 2 new commit(s) to scan." in result.output
+
+    @patch("ggshield.cmd.secret.scan.prepush.scan_commit_range")
+    def test_prepush_multiple_refs_one_failing_blocks_the_whole_push(
+        self,
+        scan_commit_range_mock: Mock,
+        tmp_path,
+        cli_fs_runner: CliRunner,
+    ):
+        """
+        GIVEN a push updating two branches
+        AND one commit pushed through the second branch contains a secret
+        WHEN the pre-push command is run
+        THEN the command exits with SCAN_FOUND_PROBLEMS, blocking the whole push
+        AND the check result is reported per ref
+        """
+        local_repo = create_local_repo_with_remote(tmp_path)
+
+        local_repo.create_branch("topic-a")
+        topic_a_shas = [local_repo.create_commit() for _ in range(2)]
+
+        local_repo.create_branch("topic-b")
+        topic_b_sha = local_repo.create_commit()
+
+        def fake_scan_commit_range(**kwargs):
+            kwargs["scan_collection_callback"](
+                SimpleNamespace(
+                    scans_with_results=[
+                        SimpleNamespace(
+                            id=topic_b_sha,
+                            results=SimpleNamespace(has_secrets=True),
+                        )
+                    ]
+                )
+            )
+            return ExitCode.SCAN_FOUND_PROBLEMS
+
+        scan_commit_range_mock.side_effect = fake_scan_commit_range
+
+        prepush_input = (
+            f"refs/heads/topic-a {topic_a_shas[-1]} "
+            f"refs/heads/topic-a {EMPTY_SHA}\n"
+            f"refs/heads/topic-b {topic_b_sha} "
+            f"refs/heads/topic-b {EMPTY_SHA}\n"
+        )
+        with cd(str(local_repo.path)):
+            result = cli_fs_runner.invoke(
+                cli,
+                ["-v", "secret", "scan", "pre-push", "origin", local_repo.remote_url],
+                input=prepush_input,
+            )
+
+        assert_invoke_exited_with(result, ExitCode.SCAN_FOUND_PROBLEMS)
+        scan_commit_range_mock.assert_called_once()
+        assert (
+            f"refs/heads/topic-b: secret(s) found in commit(s) {topic_b_sha[:8]}. "
+            "Push to this ref rejected."
+        ) in result.output
+        assert (
+            "refs/heads/topic-a: 2 commit(s) scanned, no secrets found."
+            in result.output
+        )
+        assert "How to remediate" in result.output
+
+    @patch("ggshield.cmd.secret.scan.prepush.scan_commit_range")
+    def test_prepush_multiple_refs_all_clean_allow_push(
+        self,
+        scan_commit_range_mock: Mock,
+        tmp_path,
+        cli_fs_runner: CliRunner,
+    ):
+        """
+        GIVEN a push updating two existing branches
+        AND the single (deduped) scan reports no secret
+        WHEN the pre-push command is run
+        THEN the command exits successfully and every ref is reported clean
+        """
+        local_repo = create_local_repo_with_remote(tmp_path)
+        remote_sha = local_repo.get_top_sha()
+
+        local_repo.create_branch("topic-a")
+        topic_a_shas = [local_repo.create_commit() for _ in range(2)]
+
+        # Fork topic-b from the main branch so each ref has 2 distinct commits
+        local_repo.git("checkout", "-b", "topic-b", "main")
+        topic_b_shas = [local_repo.create_commit() for _ in range(2)]
+
+        scan_commit_range_mock.return_value = 0
+
+        prepush_input = (
+            f"refs/heads/topic-a {topic_a_shas[-1]} "
+            f"refs/heads/topic-a {remote_sha}\n"
+            f"refs/heads/topic-b {topic_b_shas[-1]} "
+            f"refs/heads/topic-b {remote_sha}\n"
+        )
+        with cd(str(local_repo.path)):
+            result = cli_fs_runner.invoke(
+                cli,
+                ["-v", "secret", "scan", "pre-push", "origin", local_repo.remote_url],
+                input=prepush_input,
+            )
+
+        assert_invoke_ok(result)
+        scan_commit_range_mock.assert_called_once()
+        assert (
+            "refs/heads/topic-a: 2 commit(s) scanned, no secrets found."
+            in result.output
+        )
+        assert (
+            "refs/heads/topic-b: 2 commit(s) scanned, no secrets found."
+            in result.output
+        )
+
+    def test_parse_prepush_lines_handles_every_update(self):
+        """
+        GIVEN pre-push stdin input with branch updates and a ref deletion
+        WHEN parse_prepush_lines() parses it
+        THEN every line is turned into a PushRef with the right attributes
+        """
+        from ggshield.core.git_hooks.prepush import parse_prepush_lines
+
+        branch_sha = "a" * 40
+        deleted_sha = "b" * 40
+        prepush_input = (
+            f"refs/heads/main {branch_sha} refs/heads/main {EMPTY_SHA}\n"
+            f"(delete) {EMPTY_SHA} refs/heads/old {deleted_sha}"
+        )
+
+        push_refs = parse_prepush_lines(prepush_input)
+
+        assert len(push_refs) == 2
+        assert push_refs[0].local_ref == "refs/heads/main"
+        assert push_refs[0].local_commit == branch_sha
+        assert not push_refs[0].is_deletion
+        assert push_refs[0].name == "refs/heads/main"
+        assert push_refs[1].is_deletion
+        assert push_refs[1].name == "refs/heads/old"

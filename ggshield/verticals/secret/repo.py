@@ -5,7 +5,7 @@ from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from re import Pattern
-from typing import Callable, List, Set
+from typing import Callable, List, Optional, Set
 
 from click import UsageError
 from pygitguardian import GGClient
@@ -173,6 +173,7 @@ def scan_commit_range(
     scan_context: ScanContext,
     secret_config: SecretConfig,
     include_staged: bool = False,
+    scan_collection_callback: Optional[Callable[[SecretScanCollection], None]] = None,
 ) -> ExitCode:
     """
     Scan every commit in a range.
@@ -180,6 +181,10 @@ def scan_commit_range(
     :param client: Public Scanning API client
     :param commit_list: List of commits sha to scan
     :param verbose: Display successful scan's message
+    :param scan_collection_callback: Optional callback invoked with the whole scan
+        collection before it is processed by the output handler. It lets callers
+        inspect the per-commit results (for example to map findings back to the
+        pushed refs they belong to).
     """
     check_client_api_key(client, get_required_token_scopes_from_config(secret_config))
     max_documents = client.secret_scan_preferences.maximum_documents_per_scan
@@ -236,9 +241,11 @@ def scan_commit_range(
                 executor.shutdown(cancel_futures=True)
                 raise
 
-    return_code = output_handler.process_scan(
-        SecretScanCollection(
-            id=scan_context.command_id, type="commit-range", scans=scans
-        )
+    scan_collection = SecretScanCollection(
+        id=scan_context.command_id, type="commit-range", scans=scans
     )
+    if scan_collection_callback is not None:
+        scan_collection_callback(scan_collection)
+
+    return_code = output_handler.process_scan(scan_collection)
     return return_code
