@@ -8,6 +8,7 @@ from click import UsageError
 
 from ggshield.cmd.secret.scan.secret_scan_common_options import (
     add_secret_scan_common_options,
+    baseline_options,
     create_output_handler,
 )
 from ggshield.cmd.utils.common_decorators import GitUsage, uses_git
@@ -29,6 +30,7 @@ REGEX_GIT_URL = re.compile(
 @click.command()
 @click.argument("repository", nargs=1, type=click.STRING, required=True)
 @add_secret_scan_common_options()
+@baseline_options()
 @click.pass_context
 def repo_cmd(
     ctx: click.Context, repository: str, **kwargs: Any

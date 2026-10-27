@@ -15,6 +15,7 @@ from ggshield.core.text_utils import (
     translate_validity,
 )
 
+from ..baseline import BaselineStatus, IncidentChange
 from ..extended_match import ExtendedMatch
 from ..secret_scan_collection import (
     IgnoreKind,
@@ -61,6 +62,9 @@ def secret_file_info(
 class SecretTextOutputHandler(SecretOutputHandler):
     def _process_scan_impl(self, scan: SecretScanCollection) -> str:
         """Output Secret Scan Collection in text format"""
+        if self.get_baseline_diff(scan) is not None:
+            return self._process_scan_impl_with_baseline(scan)
+
         processed_scan_results = self.process_scan_results(scan)
 
         scan_buf = StringIO()
@@ -87,6 +91,189 @@ class SecretTextOutputHandler(SecretOutputHandler):
             )
             # TODO: display that using --all-secrets will display those
         return scan_buf.getvalue()
+
+    def _process_scan_impl_with_baseline(self, scan: SecretScanCollection) -> str:
+        """Output the scan split into new/modified, already-known and removed
+        findings, based on the comparison with the baseline."""
+        assert self.baseline_diff is not None
+        diff = self.baseline_diff
+
+        scan_buf = StringIO()
+        if self.verbose:
+            scan_buf.write(secrets_engine_version())
+
+        # ignore_sha is derived from secret contents, so group before censoring
+        grouped_by_result = {
+            id(result): group_secrets_by_ignore_sha(result.secrets)
+            for result in scan.get_all_results()
+        }
+
+        # Censor once, sections share the same Result/Line objects
+        if not self.show_secrets:
+            for result in scan.get_all_results():
+                result.censor()
+
+        new_shas = {change.ignore_sha for change in diff.new}
+        new_shas.update(change.ignore_sha for change in diff.modified)
+        unchanged_shas = {change.ignore_sha for change in diff.unchanged}
+
+        if new_shas:
+            scan_buf.write(
+                format_text("\nNew secrets since the baseline scan\n", STYLE["heading"])
+            )
+            scan_buf.write(
+                self._process_scan_results_filtered(scan, new_shas, grouped_by_result)
+            )
+        else:
+            scan_buf.write(no_new_leak_message())
+
+        if unchanged_shas:
+            scan_buf.write(
+                format_text(
+                    "\nSecrets already present in the baseline\n", STYLE["heading"]
+                )
+            )
+            if self.verbose:
+                scan_buf.write(
+                    self._process_scan_results_filtered(
+                        scan, unchanged_shas, grouped_by_result
+                    )
+                )
+            else:
+                for change in diff.unchanged:
+                    scan_buf.write(self._format_compact_change(change))
+
+        if diff.removed:
+            scan_buf.write(
+                format_text(
+                    "\nSecrets removed since the baseline scan\n", STYLE["heading"]
+                )
+            )
+            for change in diff.removed:
+                scan_buf.write(self._format_compact_change(change))
+
+        scan_buf.write(self._format_baseline_summary(diff))
+        return scan_buf.getvalue()
+
+    def _process_scan_results_filtered(
+        self,
+        scan: SecretScanCollection,
+        shas: set,
+        grouped_by_result: Dict[int, Dict[str, List[Secret]]],
+    ) -> str:
+        """Like process_scan_results(), but only render incidents whose
+        ignore_sha is in `shas`. `grouped_by_result` holds pre-censor
+        ignore_sha groupings for each result."""
+        results_buf = StringIO()
+        if scan.results:
+            current_result_buf = StringIO()
+            for result in scan.results.results:
+                current_result_buf.write(
+                    self._process_result_filtered(
+                        result, shas, grouped_by_result[id(result)]
+                    )
+                )
+            current_result_string = current_result_buf.getvalue()
+            if scan.optional_header and current_result_string:
+                results_buf.write(scan.optional_header)
+            results_buf.write(current_result_string)
+
+        if scan.scans:
+            for sub_scan in scan.scans:
+                results_buf.write(
+                    self._process_scan_results_filtered(
+                        sub_scan, shas, grouped_by_result
+                    )
+                )
+
+        return results_buf.getvalue()
+
+    def _process_result_filtered(
+        self,
+        result: Result,
+        shas: set,
+        grouped_secrets: Dict[str, List[Secret]],
+    ) -> str:
+        sha_dict = {
+            ignore_sha: secrets
+            for ignore_sha, secrets in grouped_secrets.items()
+            if ignore_sha in shas
+        }
+        if not sha_dict:
+            return ""
+
+        result_buf = StringIO()
+        for ignore_sha, secrets in sha_dict.items():
+            result_buf.write(
+                secret_header(secrets, ignore_sha, secrets[0].known_secret)
+            )
+            result_buf.write(self._format_baseline_annotation(ignore_sha))
+            result_buf.write(
+                leak_message_located(
+                    flatten_secrets_by_line(secrets),
+                    result.is_on_patch,
+                    clip_long_lines=not self.verbose,
+                )
+            )
+
+        hidden_secrets_count = sum(result.ignored_secrets_count_by_kind.values())
+        file_info_line = secret_file_info(
+            result.filename,
+            incident_count=len(sha_dict),
+            hidden_secrets_count=hidden_secrets_count,
+        )
+        return file_info_line + result_buf.getvalue()
+
+    def _format_baseline_annotation(self, ignore_sha: str) -> str:
+        assert self.baseline_diff is not None
+        change = self.baseline_diff.change_by_sha.get(ignore_sha)
+        if change is None:
+            return ""
+        indent = "   "
+        if change.status == BaselineStatus.MODIFIED:
+            previous = ", ".join(
+                f"{sha[:8]} at {location.format()}"
+                for sha, location in zip(
+                    change.previous_shas, change.previous_locations
+                )
+            )
+            return (
+                f"{indent}{format_text('Baseline:', STYLE['detector_line_start'])} "
+                f"secret content changed since the baseline scan"
+                f" (previously {previous})\n"
+            )
+        if change.status == BaselineStatus.UNCHANGED and change.relocated:
+            previous = ", ".join(
+                location.format() for location in change.previous_locations
+            )
+            return (
+                f"{indent}{format_text('Baseline:', STYLE['detector_line_start'])} "
+                f"already reported at {previous} (same secret, new location)\n"
+            )
+        return ""
+
+    @staticmethod
+    def _format_compact_change(change: IncidentChange) -> str:
+        locations = ", ".join(location.format() for location in change.locations)
+        line = f"  {change.detector}  {format_text(change.ignore_sha[:8], STYLE['ignore_sha'])}  {locations}\n"
+        if change.relocated:
+            previous = ", ".join(
+                location.format() for location in change.previous_locations
+            )
+            line += f"      moved from {previous}\n"
+        return line
+
+    @staticmethod
+    def _format_baseline_summary(diff) -> str:
+        moved_count = sum(1 for change in diff.unchanged if change.relocated)
+        return (
+            f"\nBaseline summary: "
+            f"{len(diff.new)} new, "
+            f"{len(diff.modified)} modified, "
+            f"{len(diff.unchanged)} already present"
+            f" ({moved_count} moved), "
+            f"{len(diff.removed)} removed.\n"
+        )
 
     def process_scan_results(self, scan: SecretScanCollection) -> str:
         """Iterate through the scans and sub-scan results to prepare the display."""

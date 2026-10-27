@@ -1,5 +1,5 @@
 import dataclasses
-from typing import Any, Dict, List, cast
+from typing import Any, Dict, List, Optional, cast
 
 from pygitguardian.client import VERSIONS
 from pygitguardian.models import SecretIncident
@@ -58,6 +58,11 @@ class SecretJSONOutputHandler(SecretOutputHandler):
         return scan_dict
 
     def _process_scan_impl(self, scan: SecretScanCollection) -> str:
+        # Compute the baseline diff before serializing results: incident
+        # statuses are added while processing them, and ignore_sha must be
+        # read before any censoring happens.
+        baseline_diff = self.get_baseline_diff(scan)
+
         if self.with_incident_details:
             assert self.client
             incident_details = scan.get_incident_details(self.client)
@@ -66,6 +71,34 @@ class SecretJSONOutputHandler(SecretOutputHandler):
         scan_dict = self.create_scan_dict(
             scan, top=True, incident_details=incident_details
         )
+        if baseline_diff is not None:
+            diff = baseline_diff
+            scan_dict["baseline"] = {
+                "path": (
+                    str(self.baseline.source_path)
+                    if self.baseline is not None and self.baseline.source_path
+                    else None
+                ),
+                "new_incidents": len(diff.new),
+                "modified_incidents": len(diff.modified),
+                "unchanged_incidents": len(diff.unchanged),
+                "removed_incidents": len(diff.removed),
+            }
+            scan_dict["removed_incidents"] = [
+                {
+                    "ignore_sha": change.ignore_sha,
+                    "detector": change.detector,
+                    "occurrences": [
+                        {
+                            "filename": location.path,
+                            "line_start": location.line_start,
+                            "line_end": location.line_end,
+                        }
+                        for location in change.locations
+                    ],
+                }
+                for change in diff.removed
+            ]
         text = JSONScanCollectionSchema().dumps(scan_dict)
         # dumps() return type is not defined, so cast `text`, otherwise mypy complains
         return cast(str, text)
@@ -87,8 +120,11 @@ class SecretJSONOutputHandler(SecretOutputHandler):
             result.censor()
 
         for ignore_sha, secrets in sha_dict.items():
+            baseline_status = None
+            if self.baseline_diff is not None:
+                baseline_status = self.baseline_diff.status_by_sha[ignore_sha].value
             flattened_dict = self.serialized_secret(
-                ignore_sha, secrets, incident_details
+                ignore_sha, secrets, incident_details, baseline_status
             )
             result_dict["incidents"].append(flattened_dict)
             result_dict["total_occurrences"] += flattened_dict["total_occurrences"]
@@ -113,6 +149,7 @@ class SecretJSONOutputHandler(SecretOutputHandler):
         ignore_sha: str,
         secrets: List[Secret],
         incident_details: Dict[str, SecretIncident],
+        baseline_status: Optional[str] = None,
     ) -> Dict[str, Any]:
         flattened_dict: Dict[str, Any] = {
             "occurrences": [],
@@ -121,6 +158,9 @@ class SecretJSONOutputHandler(SecretOutputHandler):
             "detector": secrets[0].detector_display_name,
             "total_occurrences": len(secrets),
         }
+
+        if baseline_status is not None:
+            flattened_dict["baseline_status"] = baseline_status
 
         if secrets[0].documentation_url:
             flattened_dict["detector_documentation"] = secrets[0].documentation_url

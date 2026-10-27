@@ -145,6 +145,131 @@ class TestPathScan:
             if json_output:
                 json.loads(result.stdout)
 
+    def test_scan_baseline_round_trip(self, cli_fs_runner):
+        """
+        GIVEN a file with a secret
+        WHEN it is scanned with --save-baseline, then again with --baseline
+        THEN the first run fails and saves a full JSON report
+        AND the second run succeeds (the secret is already in the baseline)
+        """
+        write_text(Path("file_secret"), UNCHECKED_SECRET_PATCH)
+
+        with my_vcr.use_cassette("test_scan_file_secret"):
+            first = cli_fs_runner.invoke(
+                cli,
+                [
+                    "secret",
+                    "scan",
+                    "path",
+                    "file_secret",
+                    "--save-baseline",
+                    "baseline.json",
+                ],
+            )
+            assert_invoke_exited_with(first, ExitCode.SCAN_FOUND_PROBLEMS)
+
+        baseline_path = Path("baseline.json")
+        assert baseline_path.is_file()
+        baseline_data = json.loads(baseline_path.read_text())
+        assert baseline_data["total_incidents"] == 1
+        saved_shas = [
+            incident["ignore_sha"]
+            for result in baseline_data["entities_with_incidents"]
+            for incident in result["incidents"]
+        ]
+        assert saved_shas
+
+        with my_vcr.use_cassette("test_scan_file_secret"):
+            second = cli_fs_runner.invoke(
+                cli,
+                [
+                    "secret",
+                    "scan",
+                    "path",
+                    "file_secret",
+                    "--baseline",
+                    "baseline.json",
+                ],
+            )
+            assert_invoke_ok(second)
+
+        assert "No new secrets have been found" in second.output
+        assert "1 already present" in second.output
+        for sha in saved_shas:
+            assert sha[:8] in second.output
+
+    def test_scan_baseline_json_output(self, cli_fs_runner):
+        """
+        GIVEN a baseline containing all current findings
+        WHEN scanning again with --json and --baseline
+        THEN the JSON report annotates incidents as unchanged and exits 0
+        """
+        write_text(Path("file_secret"), UNCHECKED_SECRET_PATCH)
+
+        with my_vcr.use_cassette("test_scan_file_secret"):
+            first = cli_fs_runner.invoke(
+                cli,
+                [
+                    "secret",
+                    "scan",
+                    "--json",
+                    "path",
+                    "file_secret",
+                    "--output",
+                    "baseline.json",
+                ],
+            )
+            assert_invoke_exited_with(first, ExitCode.SCAN_FOUND_PROBLEMS)
+
+        cli_fs_runner.mix_stderr = False
+        with my_vcr.use_cassette("test_scan_file_secret"):
+            second = cli_fs_runner.invoke(
+                cli,
+                [
+                    "secret",
+                    "scan",
+                    "--json",
+                    "path",
+                    "file_secret",
+                    "--baseline",
+                    "baseline.json",
+                ],
+            )
+            assert_invoke_ok(second)
+
+        report = json.loads(second.stdout)
+        assert report["baseline"]["path"].endswith("baseline.json")
+        assert {
+            key: value for key, value in report["baseline"].items() if key != "path"
+        } == {
+            "new_incidents": 0,
+            "modified_incidents": 0,
+            "unchanged_incidents": 1,
+            "removed_incidents": 0,
+        }
+        statuses = [
+            incident["baseline_status"]
+            for result in report["entities_with_incidents"]
+            for incident in result["incidents"]
+        ]
+        assert statuses == ["unchanged"]
+
+    def test_scan_invalid_baseline(self, cli_fs_runner):
+        """
+        GIVEN a baseline file which is not a ggshield JSON report
+        WHEN scanning with --baseline
+        THEN ggshield exits with an unexpected error explaining the problem
+        """
+        write_text(Path("clean_file"), "This is a file with no secrets.")
+        write_text(Path("baseline.json"), "{not valid json")
+
+        result = cli_fs_runner.invoke(
+            cli,
+            ["secret", "scan", "path", "clean_file", "--baseline", "baseline.json"],
+        )
+        assert result.exit_code == ExitCode.UNEXPECTED_ERROR
+        assert "baseline" in result.output
+
     def test_files_abort(self, cli_fs_runner):
         self.create_files()
         result = cli_fs_runner.invoke(

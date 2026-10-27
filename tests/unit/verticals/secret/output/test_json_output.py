@@ -409,7 +409,7 @@ def test_json_output_for_patch(
         scan = SecretScanCollection(id="path", type="test", results=deepcopy(results))
         json_flat_results = handler._process_scan_impl(scan)
         exit_code = SecretOutputHandler._get_exit_code(
-            Mock(ignore_known_secrets=False), scan
+            Mock(ignore_known_secrets=False, baseline_diff=None), scan
         )
 
         assert exit_code == expected_exit_code

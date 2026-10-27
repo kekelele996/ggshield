@@ -54,6 +54,11 @@ class ContextObj:
         # Set by the --output option
         self.output: Optional[Path] = None
 
+        # Set by the --baseline / --save-baseline options of full-tree scan
+        # commands (e.g. `secret scan path`)
+        self.baseline_path: Optional[Path] = None
+        self.save_baseline_path: Optional[Path] = None
+
     @property
     def should_check_for_updates(self) -> bool:
         if self.check_for_updates is None:

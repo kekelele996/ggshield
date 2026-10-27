@@ -1,4 +1,5 @@
 import uuid
+from pathlib import Path
 from typing import Callable, List, Optional
 
 import click
@@ -184,6 +185,41 @@ _source_uuid_option = click.option(
 )
 
 
+_baseline_option = click.option(
+    "--baseline",
+    "baseline_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Compare with a JSON report saved by a previous scan (`--json --output` "
+    "or `--save-baseline`). Findings already in the baseline are not reported "
+    "as new, even if they moved to another file or line. The command exits with "
+    "a non-zero status only if new or modified findings are found.",
+    callback=create_ctx_callback("baseline_path"),
+)
+
+
+_save_baseline_option = click.option(
+    "--save-baseline",
+    "save_baseline_path",
+    type=click.Path(dir_okay=False, writable=True, path_type=Path),
+    default=None,
+    help="Save the complete JSON report of this scan to PATH, independently of "
+    "the regular output. The report can later be passed to `--baseline`.",
+    callback=create_ctx_callback("save_baseline_path"),
+)
+
+
+def baseline_options() -> Callable[[AnyFunction], AnyFunction]:
+    """Add the --baseline and --save-baseline options to a scan command."""
+
+    def decorator(cmd: AnyFunction) -> AnyFunction:
+        _baseline_option(cmd)
+        _save_baseline_option(cmd)
+        return cmd
+
+    return decorator
+
+
 def add_secret_scan_common_options() -> Callable[[AnyFunction], AnyFunction]:
     def decorator(cmd: AnyFunction) -> AnyFunction:
         add_common_options()(cmd)
@@ -215,12 +251,21 @@ OUTPUT_HANDLER_CLASSES = {
 def create_output_handler(ctx: click.Context) -> SecretOutputHandler:
     """Read objects defined in ctx.obj and create the appropriate OutputHandler
     instance"""
+    from ggshield.verticals.secret.baseline import Baseline
+
     ctx_obj = ContextObj.get(ctx)
     output_handler_cls = OUTPUT_HANDLER_CLASSES[ctx_obj.output_format]
     config = ctx_obj.config
+    baseline = (
+        Baseline.load(ctx_obj.baseline_path)
+        if ctx_obj.baseline_path is not None
+        else None
+    )
     return output_handler_cls(
         verbose=ui.is_verbose(),
         client=ctx_obj.client,
         output=ctx_obj.output,
         secret_config=config.user_config.secret,
+        baseline=baseline,
+        save_baseline=ctx_obj.save_baseline_path,
     )

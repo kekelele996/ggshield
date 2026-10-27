@@ -59,6 +59,34 @@ def test_censor_match_for_a_patch():
     ]
 
 
+def test_censor_match_is_idempotent():
+    """
+    GIVEN a censored extended match
+    WHEN censor() is called again (e.g. a scan serialized several times)
+    THEN the match and its lines are not censored twice
+    """
+    content = _SINGLE_MOVE_PATCH[_SINGLE_MOVE_PATCH.index("@@") :]
+    lines = get_lines_from_content(content, Filemode.MODIFY)
+    start = 40
+    end = 108
+    match = Match(
+        match=content[start : end + 1],
+        match_type="token",
+        index_start=start,
+        index_end=end,
+    )
+
+    ex_match = ExtendedMatch.from_match(match, lines, is_patch=True)
+    ex_match.censor()
+    censored_match = ex_match.match
+    censored_line = ex_match.lines_with_secret[0].content
+
+    ex_match.censor()
+
+    assert ex_match.match == censored_match
+    assert ex_match.lines_with_secret[0].content == censored_line
+
+
 PLAIN_CONTENT_MUTIPLE_ON_ONE_LINE = """/*
 01234567890
 */

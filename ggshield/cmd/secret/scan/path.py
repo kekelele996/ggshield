@@ -5,6 +5,7 @@ import click
 
 from ggshield.cmd.secret.scan.secret_scan_common_options import (
     add_secret_scan_common_options,
+    baseline_options,
     create_output_handler,
 )
 from ggshield.cmd.secret.scan.ui_utils import print_file_list
@@ -50,6 +51,7 @@ def _expand_paths_callback(
     help="Honor content of .gitignore files. Requires git.",
 )
 @add_secret_scan_common_options()
+@baseline_options()
 @click.pass_context
 @exception_wrapper
 def path_cmd(

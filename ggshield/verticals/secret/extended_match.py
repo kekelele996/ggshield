@@ -62,6 +62,7 @@ class ExtendedMatch(Match):
         self.pre_line_end = pre_line_end
         self.post_line_start = post_line_start
         self.post_line_end = post_line_end
+        self.is_censored = False
         super().__init__(**kwargs)
 
     @classmethod
@@ -108,7 +109,12 @@ class ExtendedMatch(Match):
         """
         Censor the match and all the lines containing the secret.
         Lines are modified in place, so the secret does not appear in the context of other secrets.
+
+        Idempotent: censoring an already censored match is a no-op, so a scan
+        can be serialized several times in a row.
         """
+        if self.is_censored:
+            return
         len_match = len(self.match)
         self.match = censor_string(self.match)  # Censor the match
         assert len(self.match) == len_match
@@ -129,6 +135,7 @@ class ExtendedMatch(Match):
                 + match_split_line
                 + line.content[censor_end:]
             )
+        self.is_censored = True
 
     def __repr__(self) -> str:
         return ", ".join(

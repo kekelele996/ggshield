@@ -27,6 +27,8 @@ class FlattenedPolicyBreak(BaseSchema):
     vault_name = fields.String(required=False, allow_none=True)
     vault_path = fields.String(required=False, allow_none=True)
     vault_path_count = fields.Integer(required=False, allow_none=True)
+    # Only present when the scan is compared against a baseline
+    baseline_status = fields.String(required=False, allow_none=True)
 
 
 class JSONResultSchema(BaseSchema):
@@ -58,3 +60,6 @@ class JSONScanCollectionSchema(BaseSchema):
     total_incidents = fields.Integer(required=True)
     total_occurrences = fields.Integer(required=True)
     secrets_engine_version = fields.String(required=False)
+    # Only present when the scan is compared against a baseline
+    baseline = fields.Dict(required=False, allow_none=True)
+    removed_incidents = fields.List(fields.Dict(), required=False)
