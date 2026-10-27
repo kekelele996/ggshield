@@ -7,14 +7,20 @@ from ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault import (
     _get_vault_token,
     _split_vault_mount_and_path,
 )
+from ggshield.core.errors import ExitCode
 from ggshield.verticals.hmsl.collection import (
     NAMING_STRATEGIES,
     PreparedSecrets,
     SecretWithKey,
 )
+from ggshield.verticals.hmsl.secret_manager.hashicorp_vault.exceptions import (
+    VaultForbiddenItemError,
+)
 from ggshield.verticals.hmsl.secret_manager.hashicorp_vault.models import (
     VaultKvMount,
-    VaultSecrets,
+    VaultManifest,
+    VaultManifestEntry,
+    VaultScanResult,
 )
 
 
@@ -81,6 +87,62 @@ def test_split_vault_mount_and_path(input_str, expected_output):
     assert _split_vault_mount_and_path(input_str) == expected_output
 
 
+V2_MANIFEST = VaultManifest(
+    root_path="",
+    recursive=False,
+    entries=[
+        VaultManifestEntry(path="dev/config.env", version=1),
+        VaultManifestEntry(path="prod/config.env", version=2),
+    ],
+    unreadable_paths=[],
+)
+V1_MANIFEST = VaultManifest(
+    root_path="",
+    recursive=False,
+    entries=[VaultManifestEntry(path="dev/config.env", version=None)],
+    unreadable_paths=[],
+)
+RETURNED_API_SECRETS = [
+    ("dev/config.env/DATABASE_PASSWORD", "postgres_password"),
+    ("dev/config.env/SECRET_KEY", "my_secret_key"),
+]
+
+
+def _prepare_mocks(
+    vault_api_client_cls_mock,
+    collect_mock,
+    prepare_mock,
+    mount=VaultKvMount(name="secret", version="2"),
+    manifest=V2_MANIFEST,
+    scan_result=None,
+    build_side_effect=None,
+):
+    vault_api_client_mock = Mock()
+    vault_api_client_cls_mock.return_value = vault_api_client_mock
+    vault_api_client_mock.get_kv_mounts.return_value = [mount]
+    if build_side_effect is not None:
+        vault_api_client_mock.build_manifest.side_effect = build_side_effect
+    else:
+        vault_api_client_mock.build_manifest.return_value = manifest
+    vault_api_client_mock.scan_manifest.return_value = (
+        scan_result
+        if scan_result is not None
+        else VaultScanResult(
+            secrets=RETURNED_API_SECRETS,
+            checked_paths=[entry.path for entry in manifest.entries],
+        )
+    )
+
+    collect_mock.return_value = [
+        SecretWithKey(key=key, value=value) for key, value in RETURNED_API_SECRETS
+    ]
+    prepare_mock.return_value = PreparedSecrets(
+        payload=set([key for key, _ in RETURNED_API_SECRETS]),
+        mapping={key: f"hash_{value}" for key, value in RETURNED_API_SECRETS},
+    )
+    return vault_api_client_mock
+
+
 @patch("ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.check_secrets")
 @patch(
     "ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.prepare",
@@ -93,11 +155,8 @@ def test_split_vault_mount_and_path(input_str, expected_output):
 @patch(
     "ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.VaultAPIClient",
 )
-@pytest.mark.parametrize("use_cli_token", [True, False])
 @pytest.mark.parametrize("recursive", [True, False])
-@pytest.mark.parametrize("mount_not_found", [True, False])
-@pytest.mark.parametrize("verbose", [True, False])
-def test_check_hashicorp_vault_cmd(
+def test_check_hashicorp_vault_cmd_lists_manifest_and_succeeds(
     vault_api_client_cls_mock,
     get_vault_token_mock,
     collect_mock,
@@ -105,14 +164,12 @@ def test_check_hashicorp_vault_cmd(
     check_secrets_mock,
     cli_fs_runner,
     recursive,
-    use_cli_token,
-    mount_not_found,
-    verbose,
 ):
     """
     GIVEN the hmsl check-secret-manager hashicorp-vault command
-    WHEN calling the command with different arguments
-    THEN the expected vertical calls are made to compute the result
+    WHEN every manifest entry is checked against a stable version
+    THEN the paths and versions are listed before fetching, the secrets are
+    checked and the command succeeds
     """
     args = [
         "hmsl",
@@ -124,74 +181,353 @@ def test_check_hashicorp_vault_cmd(
     ]
     if recursive:
         args.append("--recursive")
-    if use_cli_token:
-        args.append("--use-cli-token")
-    if verbose:
-        args.append("--verbose")
 
-    vault_api_client_mock = Mock()
-    vault_api_client_cls_mock.return_value = vault_api_client_mock
-    vault_api_client_mock.get_kv_mounts.return_value = (
-        [] if mount_not_found else [VaultKvMount(name="secret", version="2")]
-    )
-    returned_api_secrets = [
-        ("DATABASE_PASSWORD", "postgres_password"),
-        ("SECRET_KEY", "my_secret_key"),
-    ]
-    collect_mock.return_value = [
-        SecretWithKey(key=key, value=value) for key, value in returned_api_secrets
-    ]
-    prepare_mock.return_value = PreparedSecrets(
-        payload=set([key for key, _ in returned_api_secrets]),
-        mapping={key: f"hash_{value}" for key, value in returned_api_secrets},
-    )
-    vault_api_client_mock.get_secrets.return_value = VaultSecrets(
-        secrets=returned_api_secrets,
-        not_fetched_paths=["super_secret_path", "prod_credentials"],
+    vault_api_client_mock = _prepare_mocks(
+        vault_api_client_cls_mock, collect_mock, prepare_mock
     )
 
     cmd_ret = cli_fs_runner.invoke(cli, args)
 
-    # get_vault_token is called and the API client is initialized
-    get_vault_token_mock.assert_called_once_with(use_cli_token)
-    vault_api_client_cls_mock.assert_called_once_with(
-        "http://127.0.0.1:6789", "vault_token"
-    )
-
-    # Get the KV mounts and return an error if not found, else continue
-    vault_api_client_mock.get_kv_mounts.assert_called_once()
-    if mount_not_found:
-        assert cmd_ret.exit_code == 128
-        assert (
-            cmd_ret.output
-            == "Error: mount secret not found. Make sure it exists and that your token has access to it.\n"
-        )
-        return
-
-    # Secrets are fetched
-    vault_api_client_mock.get_secrets.assert_called_once_with(
+    vault_api_client_mock.build_manifest.assert_called_once_with(
         VaultKvMount(name="secret", version="2"), "", recursive
     )
-
-    # Collect, prepare and common check are called
-    collect_mock.assert_called_once_with(returned_api_secrets)
+    vault_api_client_mock.scan_manifest.assert_called_once_with(
+        VaultKvMount(name="secret", version="2"), V2_MANIFEST
+    )
+    collect_mock.assert_called_once_with(RETURNED_API_SECRETS)
     prepare_mock.assert_called_once_with(
         collect_mock.return_value, NAMING_STRATEGIES["key"], full_hashes=True
     )
     check_secrets_mock.assert_called_once()
 
-    assert cmd_ret.exit_code == 0
+    assert cmd_ret.exit_code == ExitCode.SUCCESS
+    assert "Building the list of paths to check...\n" in cmd_ret.output
+    assert "2 paths will be checked:\n" in cmd_ret.output
+    assert "- dev/config.env (version 1)\n" in cmd_ret.output
+    assert "- prod/config.env (version 2)\n" in cmd_ret.output
     assert "Fetching secrets from Vault...\n" in cmd_ret.output
-    assert (
-        "Could not fetch 2 paths. Make sure your token has access to all the secrets in your vault.\n"
-        in cmd_ret.output
+    assert "Checked 2 paths and got 2 secrets.\n" in cmd_ret.output
+
+
+@patch("ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.check_secrets")
+@patch(
+    "ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.prepare",
+)
+@patch("ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.collect_list")
+@patch(
+    "ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault._get_vault_token",
+    return_value="vault_token",
+)
+@patch(
+    "ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.VaultAPIClient",
+)
+def test_check_hashicorp_vault_cmd_v1_manifest_without_versions(
+    vault_api_client_cls_mock,
+    get_vault_token_mock,
+    collect_mock,
+    prepare_mock,
+    check_secrets_mock,
+    cli_fs_runner,
+):
+    """
+    GIVEN a KV v1 mount
+    WHEN listing the manifest
+    THEN the paths are listed without a version
+    """
+    _prepare_mocks(
+        vault_api_client_cls_mock,
+        collect_mock,
+        prepare_mock,
+        mount=VaultKvMount(name="secret_v1", version="1"),
+        manifest=V1_MANIFEST,
+        scan_result=VaultScanResult(
+            secrets=RETURNED_API_SECRETS, checked_paths=["dev/config.env"]
+        ),
     )
-    assert "Got 2 secrets.\n" in cmd_ret.output
-    if verbose:
-        assert (
-            """Error: > The following paths could not be fetched:
-Error: - super_secret_path
-Error: - prod_credentials
-"""
-            in cmd_ret.output
-        )
+
+    cmd_ret = cli_fs_runner.invoke(
+        cli,
+        [
+            "hmsl",
+            "check-secret-manager",
+            "hashicorp-vault",
+            "--url",
+            "http://127.0.0.1:6789",
+            "secret_v1",
+        ],
+    )
+
+    assert cmd_ret.exit_code == ExitCode.SUCCESS
+    assert "1 path will be checked:\n" in cmd_ret.output
+    assert "- dev/config.env\n" in cmd_ret.output
+    assert "(version" not in cmd_ret.output
+
+
+@patch("ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.check_secrets")
+@patch(
+    "ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.prepare",
+)
+@patch("ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.collect_list")
+@patch(
+    "ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault._get_vault_token",
+    return_value="vault_token",
+)
+@patch(
+    "ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.VaultAPIClient",
+)
+def test_check_hashicorp_vault_cmd_incomplete_manifest_fails(
+    vault_api_client_cls_mock,
+    get_vault_token_mock,
+    collect_mock,
+    prepare_mock,
+    check_secrets_mock,
+    cli_fs_runner,
+):
+    """
+    GIVEN a scan where a path changed and another could not be read
+    WHEN running the command
+    THEN the two buckets are reported separately, the checked secrets are
+    still checked and the command exits with the SCAN_FOUND_PROBLEMS code
+    """
+    scan_result = VaultScanResult(
+        secrets=RETURNED_API_SECRETS,
+        checked_paths=["dev/config.env"],
+        changed_paths=["changed/config.env"],
+        not_fetched_paths=["restricted/config.env"],
+    )
+    _prepare_mocks(
+        vault_api_client_cls_mock,
+        collect_mock,
+        prepare_mock,
+        scan_result=scan_result,
+    )
+
+    cmd_ret = cli_fs_runner.invoke(
+        cli,
+        [
+            "hmsl",
+            "check-secret-manager",
+            "hashicorp-vault",
+            "--url",
+            "http://127.0.0.1:6789",
+            "secret",
+        ],
+    )
+
+    # The checked secrets are still sent for checking
+    check_secrets_mock.assert_called_once()
+    assert cmd_ret.exit_code == ExitCode.SCAN_FOUND_PROBLEMS
+    assert "Checked 1 path and got 2 secrets.\n" in cmd_ret.output
+    assert (
+        "1 path changed during the scan and could not be checked. "
+        "Re-run the command to check them:\n" in cmd_ret.output
+    )
+    assert "Error: - changed/config.env\n" in cmd_ret.output
+    assert (
+        "Could not fetch 1 path. Make sure your token has access to all the "
+        "secrets in your vault:\n" in cmd_ret.output
+    )
+    assert "Error: - restricted/config.env\n" in cmd_ret.output
+    assert "All right!" not in cmd_ret.output
+
+
+@patch("ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.check_secrets")
+@patch(
+    "ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.prepare",
+)
+@patch("ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.collect_list")
+@patch(
+    "ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault._get_vault_token",
+    return_value="vault_token",
+)
+@patch(
+    "ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.VaultAPIClient",
+)
+def test_check_hashicorp_vault_cmd_incomplete_without_secrets_fails(
+    vault_api_client_cls_mock,
+    get_vault_token_mock,
+    collect_mock,
+    prepare_mock,
+    check_secrets_mock,
+    cli_fs_runner,
+):
+    """
+    GIVEN an incomplete scan with no secret to check
+    WHEN running the command
+    THEN no leaked-secret heading is shown, the API is not queried and the
+    command still fails
+    """
+    scan_result = VaultScanResult(
+        secrets=[],
+        checked_paths=[],
+        changed_paths=["changed/config.env"],
+        not_fetched_paths=["restricted/config.env"],
+    )
+    _prepare_mocks(
+        vault_api_client_cls_mock,
+        collect_mock,
+        prepare_mock,
+        scan_result=scan_result,
+    )
+    prepare_mock.return_value = PreparedSecrets(payload=set(), mapping={})
+
+    cmd_ret = cli_fs_runner.invoke(
+        cli,
+        [
+            "hmsl",
+            "check-secret-manager",
+            "hashicorp-vault",
+            "--url",
+            "http://127.0.0.1:6789",
+            "secret",
+        ],
+    )
+
+    check_secrets_mock.assert_not_called()
+    assert cmd_ret.exit_code == ExitCode.SCAN_FOUND_PROBLEMS
+    assert "All right!" not in cmd_ret.output
+
+
+@patch("ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.check_secrets")
+@patch(
+    "ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.prepare",
+)
+@patch("ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.collect_list")
+@patch(
+    "ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault._get_vault_token",
+    return_value="vault_token",
+)
+@patch(
+    "ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.VaultAPIClient",
+)
+def test_check_hashicorp_vault_cmd_empty_manifest_succeeds(
+    vault_api_client_cls_mock,
+    get_vault_token_mock,
+    collect_mock,
+    prepare_mock,
+    check_secrets_mock,
+    cli_fs_runner,
+):
+    """
+    GIVEN a complete but empty manifest
+    WHEN running the command
+    THEN the command reports there is nothing to check and succeeds
+    """
+    empty_manifest = VaultManifest(
+        root_path="", recursive=False, entries=[], unreadable_paths=[]
+    )
+    _prepare_mocks(
+        vault_api_client_cls_mock,
+        collect_mock,
+        prepare_mock,
+        manifest=empty_manifest,
+        scan_result=VaultScanResult(),
+    )
+    prepare_mock.return_value = PreparedSecrets(payload=set(), mapping={})
+
+    cmd_ret = cli_fs_runner.invoke(
+        cli,
+        [
+            "hmsl",
+            "check-secret-manager",
+            "hashicorp-vault",
+            "--url",
+            "http://127.0.0.1:6789",
+            "secret",
+        ],
+    )
+
+    check_secrets_mock.assert_not_called()
+    assert cmd_ret.exit_code == ExitCode.SUCCESS
+    assert "No secret path found to check.\n" in cmd_ret.output
+    assert "All right! No leaked secret has been found.\n" in cmd_ret.output
+
+
+@patch("ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.check_secrets")
+@patch(
+    "ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.prepare",
+)
+@patch("ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.collect_list")
+@patch(
+    "ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault._get_vault_token",
+    return_value="vault_token",
+)
+@patch(
+    "ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.VaultAPIClient",
+)
+def test_check_hashicorp_vault_cmd_forbidden_root_path(
+    vault_api_client_cls_mock,
+    get_vault_token_mock,
+    collect_mock,
+    prepare_mock,
+    check_secrets_mock,
+    cli_fs_runner,
+):
+    """
+    GIVEN a vault path that cannot be accessed at all
+    WHEN building the manifest raises a forbidden error
+    THEN an unexpected error is raised and the command fails with code 128
+    """
+    vault_api_client_mock = Mock()
+    vault_api_client_cls_mock.return_value = vault_api_client_mock
+    vault_api_client_mock.get_kv_mounts.return_value = [
+        VaultKvMount(name="secret", version="2")
+    ]
+    vault_api_client_mock.build_manifest.side_effect = VaultForbiddenItemError()
+
+    cmd_ret = cli_fs_runner.invoke(
+        cli,
+        [
+            "hmsl",
+            "check-secret-manager",
+            "hashicorp-vault",
+            "--url",
+            "http://127.0.0.1:6789",
+            "secret",
+        ],
+    )
+
+    vault_api_client_mock.scan_manifest.assert_not_called()
+    check_secrets_mock.assert_not_called()
+    assert cmd_ret.exit_code == 128
+    assert "access to the given path 'secret' was forbidden" in cmd_ret.output
+
+
+@patch(
+    "ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault._get_vault_token",
+    return_value="vault_token",
+)
+@patch(
+    "ggshield.cmd.hmsl.check_secret_manager.hashicorp_vault.VaultAPIClient",
+)
+def test_check_hashicorp_vault_cmd_mount_not_found(
+    vault_api_client_cls_mock,
+    get_vault_token_mock,
+    cli_fs_runner,
+):
+    """
+    GIVEN a mount name that does not exist
+    WHEN running the command
+    THEN an error is displayed and the command fails with code 128
+    """
+    vault_api_client_mock = Mock()
+    vault_api_client_cls_mock.return_value = vault_api_client_mock
+    vault_api_client_mock.get_kv_mounts.return_value = []
+
+    cmd_ret = cli_fs_runner.invoke(
+        cli,
+        [
+            "hmsl",
+            "check-secret-manager",
+            "hashicorp-vault",
+            "--url",
+            "http://127.0.0.1:6789",
+            "secret",
+        ],
+    )
+
+    assert cmd_ret.exit_code == 128
+    assert (
+        "Error: mount secret not found. Make sure it exists and that your "
+        "token has access to it.\n" == cmd_ret.output
+    )

@@ -14,7 +14,7 @@ from ggshield.cmd.utils.common_options import (
     text_json_format_option,
 )
 from ggshield.core import ui
-from ggshield.core.errors import UnexpectedError
+from ggshield.core.errors import ExitCode, UnexpectedError
 from ggshield.core.text_utils import pluralize
 from ggshield.verticals.hmsl.collection import NamingStrategy, collect_list, prepare
 from ggshield.verticals.hmsl.secret_manager.hashicorp_vault.api_client import (
@@ -26,6 +26,11 @@ from ggshield.verticals.hmsl.secret_manager.hashicorp_vault.cli import (
 from ggshield.verticals.hmsl.secret_manager.hashicorp_vault.exceptions import (
     VaultCliTokenFetchingError,
     VaultForbiddenItemError,
+)
+from ggshield.verticals.hmsl.secret_manager.hashicorp_vault.models import (
+    VaultKvMount,
+    VaultManifest,
+    VaultScanResult,
 )
 
 
@@ -59,6 +64,64 @@ def _split_vault_mount_and_path(initial_path: str) -> Tuple[str, str]:
     """
     split_path = initial_path.lstrip("/").split("/")
     return (split_path[0], "/".join(split_path[1:]).strip("/"))
+
+
+def _display_manifest(mount: VaultKvMount, manifest: VaultManifest) -> None:
+    """
+    Display the paths and versions that will be checked during this scan,
+    before any content is fetched.
+    """
+    entries = manifest.entries
+    if not entries:
+        ui.display_info("No secret path found to check.")
+        return
+
+    ui.display_info(
+        f"{len(entries)} {pluralize('path', len(entries))} will be checked:"
+    )
+    for entry in entries:
+        if mount.version == "2":
+            version_info = (
+                f"version {entry.version}"
+                if entry.version is not None
+                else "version unknown"
+            )
+            ui.display_info(f"- {entry.path} ({version_info})")
+        else:
+            # KV v1 mounts do not support versioning
+            ui.display_info(f"- {entry.path}")
+
+
+def _display_scan_result(result: VaultScanResult) -> None:
+    """
+    Display the result of the scan, separating the entries that were checked
+    from the ones that changed during the scan and the ones that could not
+    be read.
+    """
+    ui.display_info(
+        f"Checked {len(result.checked_paths)} "
+        f"{pluralize('path', len(result.checked_paths))} and got "
+        f"{len(result.secrets)} {pluralize('secret', len(result.secrets))}."
+    )
+
+    if result.changed_paths:
+        change_count = len(result.changed_paths)
+        ui.display_error(
+            f"{change_count} {pluralize('path', change_count)} changed during "
+            "the scan and could not be checked. Re-run the command to check them:"
+        )
+        for path in result.changed_paths:
+            ui.display_error(f"- {path}")
+
+    if result.not_fetched_paths:
+        not_fetched_count = len(result.not_fetched_paths)
+        ui.display_error(
+            f"Could not fetch {not_fetched_count} "
+            f"{pluralize('path', not_fetched_count)}. Make sure your token has "
+            "access to all the secrets in your vault:"
+        )
+        for path in result.not_fetched_paths:
+            ui.display_error(f"- {path}")
 
 
 @click.command()
@@ -111,6 +174,12 @@ def check_hashicorp_vault_cmd(
     Check secrets of an Hashicorp Vault instance.
     Only compatible with the kv secret engines (v1 or v2) for now.
 
+    The paths and their versions are listed before any content is fetched
+    and the content is then read against this exact list. Paths that are
+    added, deleted or modified while the scan is running, as well as paths
+    the token cannot read, are reported separately: the command only
+    succeeds if the whole list was checked against a stable version.
+
     Will use the VAULT_URL environment variable to get the Vault instance URL or
     the --url option if no environment variable is set.
 
@@ -140,9 +209,10 @@ def check_hashicorp_vault_cmd(
             "that your token has access to it."
         )
 
-    ui.display_info("Fetching secrets from Vault...")
+    # Phase 1: build the manifest (paths and versions) without fetching content.
+    ui.display_info("Building the list of paths to check...")
     try:
-        result = vault_client.get_secrets(mount, secret_path, recursive)
+        manifest = vault_client.build_manifest(mount, secret_path, recursive)
     # catch this error here if the path provided is a file that we don't have access to
     except VaultForbiddenItemError:
         raise UnexpectedError(
@@ -150,28 +220,33 @@ def check_hashicorp_vault_cmd(
             "Are you sure the permissions of the token are correct?"
         )
 
-    if len(result.not_fetched_paths) > 0:
-        ui.display_error(
-            f"Could not fetch {len(result.not_fetched_paths)} paths. "
-            "Make sure your token has access to all the secrets in your vault."
+    _display_manifest(mount, manifest)
+
+    # Phase 2: fetch the content against the manifest and reconcile it.
+    ui.display_info("Fetching secrets from Vault...")
+    try:
+        result = vault_client.scan_manifest(mount, manifest)
+    except VaultForbiddenItemError:
+        raise UnexpectedError(
+            f"access to the given path '{vault_path}' was forbidden. "
+            "Are you sure the permissions of the token are correct?"
         )
-        if ui.is_verbose():
-            ui.display_error("> The following paths could not be fetched:")
-            for path in result.not_fetched_paths:
-                ui.display_error(f"- {path}")
-    ui.display_info(
-        f"Got {len(result.secrets)} {pluralize('secret', len(result.secrets))}."
-    )
+
+    _display_scan_result(result)
 
     collected_secrets = collect_list(result.secrets)
     # full_hashes is True because we need the hashes to decrypt the secrets.
     # They will correctly be truncated by our client later (same as normal check cmd)
     prepared_secrets = prepare(collected_secrets, naming_strategy, full_hashes=True)
 
+    # The scan is only successful when the manifest was fully reconciled.
+    exit_code = ExitCode.SUCCESS if result.is_complete else ExitCode.SCAN_FOUND_PROBLEMS
+
     # Short-circuit if no secrets to check
     if len(prepared_secrets.payload) == 0:
-        ui.display_heading("All right! No leaked secret has been found.")
-        return 0
+        if result.is_complete:
+            ui.display_heading("All right! No leaked secret has been found.")
+        return exit_code
 
     check_secrets(
         ctx=ctx,
@@ -179,4 +254,4 @@ def check_hashicorp_vault_cmd(
         full_hashes=full_hashes,
     )
 
-    return 0
+    return exit_code
