@@ -4,9 +4,10 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from collections.abc import MutableMapping
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
@@ -47,6 +48,50 @@ class BuildConfigResult:
     settings_path: Path
     new_config: MutableMapping[str, Any]
     stats: InstallationStats
+
+
+@dataclass
+class StagedInstall:
+    """One settings file, validated and rendered in memory, not yet written.
+
+    ``agents`` can hold more than one agent: Copilot CLI and VSCode configure
+    the same global hooks file, so their templates are merged into one staged
+    write instead of being installed as two targets that each read and rewrite
+    the same file.
+    """
+
+    agents: List[Agent]
+    settings_path: Path
+    new_config: MutableMapping[str, Any]
+    rendered: str
+    stats_by_agent: Dict[str, InstallationStats]
+
+    def stats_for(self, agent: Agent) -> InstallationStats:
+        return self.stats_by_agent[agent.name]
+
+
+@dataclass
+class HookTargetFailure:
+    """A settings target that could not be staged or written.
+
+    It names both the assistant(s) and the exact settings file, which is what a
+    batch run must report instead of dying on the first bad file and leaving the
+    user to diff every assistant's settings by hand.
+    """
+
+    display_names: str
+    settings_path: Path
+    reason: str
+
+
+class HookCommitError(RuntimeError):
+    """A staged file could not be written, and every other file was restored."""
+
+    def __init__(self, agents: Sequence[Agent], settings_path: Path, reason: str):
+        self.agents = list(agents)
+        self.settings_path = settings_path
+        self.reason = reason
+        super().__init__(f"{settings_path}: {reason}")
 
 
 _HOOK_ARGS = "secret scan ai-hook"
@@ -217,24 +262,36 @@ def install_hooks(
 
     Returns an error code (0 on success, 1 on failure)
     """
+    try:
+        agent = AGENTS[name]
+    except KeyError:
+        raise ValueError(f"Unsupported agent: {name}")
 
-    result = build_hook_config(name, mode, force)
-    settings_path = result.settings_path
-    new_config = result.new_config
-    stats = result.stats
-    display_name = result.agent.display_name
-    # Ensure parent directory exists
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    # Stage (read, parse, merge, render, writability check) before the file is
+    # touched, then commit through the same all-or-nothing writer the batch
+    # uses: a crash or an I/O error can no longer leave a truncated settings
+    # file behind.
+    try:
+        staged = _stage_agents([agent], mode, force)
+        commit_staged_installs([staged])
+    except HookCommitError as exc:
+        raise UnexpectedError(
+            f"Failed to write {exc.settings_path}: {exc.reason}. "
+            "The original settings were left unchanged."
+        ) from exc
 
-    # Write the updated config in the assistant's native format.
-    with settings_path.open("w", encoding="utf-8") as f:
-        if result.agent.settings_format == "toml":
-            f.write(tomlkit.dumps(new_config))
-        else:
-            json.dump(new_config, f, indent=2)
-            f.write("\n")
+    _report_install_result(agent, staged.settings_path, staged.stats_for(agent), mode)
+    return 0
 
-    # Report what happened
+
+def _report_install_result(
+    agent: Agent,
+    settings_path: Path,
+    stats: InstallationStats,
+    mode: Literal["local", "global"],
+) -> None:
+    """Print what an install did for one assistant, plus its reload warning."""
+    display_name = agent.display_name
     styled_path = click.style(settings_path, fg="yellow", bold=True)
     if stats.added == 0 and stats.already_present > 0:
         click.echo(f"{display_name} hooks already installed in {styled_path}")
@@ -243,10 +300,259 @@ def install_hooks(
     else:
         click.echo(f"{display_name} hooks successfully added in {styled_path}")
 
-    if warning := result.agent.post_install_warning(mode):
+    if warning := agent.post_install_warning(mode):
         ui.display_warning(warning)
 
-    return 0
+
+def _render_settings(
+    agent: Agent, config: MutableMapping[str, Any], settings_path: Path
+) -> str:
+    """Serialize the merged config in the assistant's native format.
+
+    Rendering is part of the staging, not the write: a document we cannot
+    serialize must abort the run like an unparseable input, instead of writing a
+    file the assistant cannot load.
+    """
+    try:
+        if agent.settings_format == "toml":
+            return tomlkit.dumps(config)
+        return json.dumps(config, indent=2) + "\n"
+    except (TOMLKitError, TypeError, ValueError) as exc:
+        raise UnexpectedError(
+            f"Failed to serialize the updated settings for {settings_path}: "
+            f"{exc}. Please fix or remove the file before installing hooks."
+        ) from exc
+
+
+def _assert_target_writable(settings_path: Path) -> None:
+    """Check that the settings file can be (re)created and written, touching nothing.
+
+    The check is best effort: root bypasses permission bits and an ACL can
+    change between this check and the commit, so the commit phase still backs
+    every file up and rolls back. Its job is to fail BEFORE the first file of
+    the batch has been replaced.
+    """
+    if settings_path.exists():
+        if not settings_path.is_file():
+            raise PermissionError(f"{settings_path} exists and is not a file")
+        if not os.access(settings_path, os.W_OK):
+            raise PermissionError(f"{settings_path} is not writable")
+    ancestor = settings_path.parent
+    while not ancestor.exists():
+        ancestor = ancestor.parent
+    if not ancestor.is_dir() or not os.access(ancestor, os.W_OK | os.X_OK):
+        raise PermissionError(
+            f"cannot create {settings_path}: {ancestor} is not a writable directory"
+        )
+
+
+def _stage_agents(
+    agents: Sequence[Agent],
+    mode: Literal["local", "global"],
+    force: bool = False,
+) -> StagedInstall:
+    """Validate, merge and render the hooks for agents sharing one settings file.
+
+    Only reads: nothing is created, truncated or written. Parse and shape
+    failures come out as :class:`UnexpectedError` (see
+    :func:`build_hook_config`), I/O failures as :class:`OSError`; both carry
+    the settings path so the batch can name the failing target.
+    """
+    first = agents[0]
+    result = build_hook_config(first.name, mode, force)
+    config = result.new_config
+    stats_by_agent = {first.name: result.stats}
+
+    command = build_hook_command()
+    for agent in agents[1:]:
+        # Same settings file: merge each agent's template into the one document,
+        # with per-agent stats so the report says "added"/"already installed"
+        # independently even though the write is shared.
+        agent_stats = InstallationStats()
+        _fill_dict(
+            config=config,
+            template=agent.settings_template,
+            command=command,
+            overwrite=force,
+            stats=agent_stats,
+            locator=agent.settings_locate,
+        )
+        stats_by_agent[agent.name] = agent_stats
+
+    rendered = _render_settings(first, config, result.settings_path)
+    _assert_target_writable(result.settings_path)
+    return StagedInstall(
+        agents=list(agents),
+        settings_path=result.settings_path,
+        new_config=config,
+        rendered=rendered,
+        stats_by_agent=stats_by_agent,
+    )
+
+
+@dataclass
+class _PreparedFile:
+    """A staged file sitting in a same-directory temp file, ready to rename."""
+
+    staged: StagedInstall
+    settings_path: Path
+    existed: bool
+    mode: int
+    tmp_path: Optional[Path]
+    backup_path: Optional[Path]
+
+
+def _default_file_mode() -> int:
+    """Mode a newly created settings file gets, honoring the process umask."""
+    umask = os.umask(0)
+    os.umask(umask)
+    return 0o666 & ~umask
+
+
+def _prepare_one(staged: StagedInstall, created_dirs: List[Path]) -> _PreparedFile:
+    """Create parent dirs, back up an existing file, and stage the temp file.
+
+    Nothing is renamed in place here: any failure leaves the settings file
+    exactly as it was.
+    """
+    settings_path = staged.settings_path
+    parent = settings_path.parent
+
+    missing_dirs: List[Path] = []
+    ancestor = parent
+    while not ancestor.exists():
+        missing_dirs.append(ancestor)
+        ancestor = ancestor.parent
+    for directory in reversed(missing_dirs):
+        directory.mkdir(exist_ok=True)
+        created_dirs.append(directory)
+
+    existed = settings_path.exists()
+    mode = os.stat(settings_path).st_mode & 0o7777 if existed else _default_file_mode()
+
+    backup_path: Optional[Path] = None
+    if existed:
+        # Same directory: the backup and the final file stay on one filesystem,
+        # which is what makes the restore rename atomic too.
+        backup_fd, backup_name = tempfile.mkstemp(
+            prefix=f".{settings_path.name}.ggshield-backup-", dir=parent
+        )
+        os.close(backup_fd)
+        backup_path = Path(backup_name)
+        shutil.copyfile(settings_path, backup_path)
+
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{settings_path.name}.ggshield-tmp-", dir=parent
+    )
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            f.write(staged.rendered)
+            f.flush()
+            os.fsync(f.fileno())
+        # mkstemp creates the temp file 0600; give it the original file's mode
+        # (or the umask-default one) before it takes the settings file's place.
+        os.chmod(tmp_name, mode)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+    return _PreparedFile(
+        staged=staged,
+        settings_path=settings_path,
+        existed=existed,
+        mode=mode,
+        tmp_path=Path(tmp_name),
+        backup_path=backup_path,
+    )
+
+
+def _unlink_quietly(path: Optional[Path]) -> None:
+    if path is not None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def _restore(
+    prepared: Sequence[_PreparedFile],
+    replaced: Sequence[_PreparedFile],
+    created_dirs: Sequence[Path],
+) -> None:
+    """Put the settings files back the way they were before the commit.
+
+    Replaced files get their byte-exact backup renamed back (or are deleted if
+    they did not exist); the others only need their temp and backup removed.
+    """
+    replaced_ids = {id(item) for item in replaced}
+    for item in prepared:
+        if id(item) in replaced_ids:
+            try:
+                if item.existed and item.backup_path is not None:
+                    os.replace(item.backup_path, item.settings_path)
+                    try:
+                        os.chmod(item.settings_path, item.mode)
+                    except OSError:
+                        pass
+                else:
+                    item.settings_path.unlink(missing_ok=True)
+            except OSError:
+                # Keep going: restoring the remaining files matters more than
+                # surfacing an error that would hide the original failure.
+                pass
+        else:
+            _unlink_quietly(item.tmp_path)
+            _unlink_quietly(item.backup_path)
+
+    # Only directories we created, leaves first: rmdir fails on non-empty ones,
+    # which is the correct signal to leave a directory that gained other files.
+    for directory in reversed(created_dirs):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+
+def commit_staged_installs(staged_installs: Sequence[StagedInstall]) -> None:
+    """Write every staged settings file, all or nothing.
+
+    Two phases:
+
+    1. prepare: create missing parent directories, back up every existing file
+       byte-for-byte, and write the new content to a same-directory temp file.
+       A failure here has replaced nothing.
+    2. commit: rename the temp files into place one by one (a same-directory
+       rename is atomic). If one fails, the renames already done are rolled
+       back from the backups and brand-new files are deleted.
+
+    Raises :class:`HookCommitError` only once the disk is back to its
+    pre-call state.
+    """
+    created_dirs: List[Path] = []
+    prepared: List[_PreparedFile] = []
+    replaced: List[_PreparedFile] = []
+    current: Optional[StagedInstall] = None
+    try:
+        for staged in staged_installs:
+            current = staged
+            prepared.append(_prepare_one(staged, created_dirs))
+
+        for item in prepared:
+            current = item.staged
+            assert item.tmp_path is not None
+            os.replace(item.tmp_path, item.settings_path)
+            replaced.append(item)
+
+        # Every rename succeeded: the byte backups have no more role and must
+        # not linger next to the settings files.
+        for item in prepared:
+            _unlink_quietly(item.backup_path)
+    except OSError as exc:
+        assert current is not None
+        _restore(prepared, replaced, created_dirs)
+        raise HookCommitError(current.agents, current.settings_path, str(exc)) from exc
 
 
 def build_hook_config(
@@ -364,12 +670,17 @@ def _fill_dict(
             config_list = config.setdefault(key, [])
             if not isinstance(config_list, list):
                 raise ValueError(f"expected a list of objects at '{key}'")
-            # Ignore anything that isn't an object: the file is hand-editable and a
-            # stray scalar must not crash the install.
-            candidates = [item for item in config_list if isinstance(item, dict)]
             for template_item in value:
                 if not isinstance(template_item, dict):
                     raise ValueError(f"Expected objects in template list for {key}")
+                # Re-read the candidates for every template item: an object
+                # appended earlier in this same loop must be locatable, or two
+                # template items that match the same slot would each append
+                # their own copy -- and a re-run would grow a second ggshield
+                # entry next to the first one. Ignore anything that isn't an
+                # object: the file is hand-editable and a stray scalar must not
+                # crash the install.
+                candidates = [item for item in config_list if isinstance(item, dict)]
                 existing_value = locator(candidates, template_item)
                 if existing_value is not None:
                     # Found it. Continue with this object.
@@ -463,6 +774,9 @@ class SetupSummary:
 
     configured: int = 0
     failed: int = 0
+    # Every target that could not be staged or written, with the assistant name
+    # and settings path. Empty on success.
+    failures: List[HookTargetFailure] = field(default_factory=list)
 
 
 def select_agents(only: Sequence[str], exclude: Sequence[str]) -> List[Agent]:
@@ -481,6 +795,53 @@ def select_agents(only: Sequence[str], exclude: Sequence[str]) -> List[Agent]:
     return agents
 
 
+def _group_agents_by_settings(
+    agents: Sequence[Agent], mode: Literal["local", "global"]
+) -> List[Tuple[Path, List[Agent]]]:
+    """Group agents by their settings file path, preserving the agents' order.
+
+    Two agents can target the same file (Copilot CLI and VSCode both configure
+    ``~/.copilot/hooks/hooks.json``). Installing them as separate targets would
+    build twice from the same original content -- and report one failure twice.
+    They become one staged write into which both templates are merged.
+    """
+    base_dir = get_user_home_dir() if mode == "global" else Path(".")
+    groups: Dict[str, List[Agent]] = {}
+    paths: Dict[str, Path] = {}
+    ordered_keys: List[str] = []
+    for agent in agents:
+        settings_path = base_dir / agent.settings_path(mode)
+        key = str(settings_path)
+        if key not in groups:
+            groups[key] = []
+            paths[key] = settings_path
+            ordered_keys.append(key)
+        groups[key].append(agent)
+    return [(paths[key], groups[key]) for key in ordered_keys]
+
+
+def _display_names(agents: Sequence[Agent]) -> str:
+    return ", ".join(agent.display_name for agent in agents)
+
+
+def _report_staging_failures(failures: Sequence[HookTargetFailure]) -> None:
+    """Name every assistant/settings pair that blocked the run.
+
+    Staging failed, so by construction no file was written: say so explicitly,
+    because the previous behavior left earlier assistants' files modified and
+    the user had to discover and restore them by hand.
+    """
+    ui.display_error(
+        f"AI hooks could not be installed for {len(failures)} "
+        f"{pluralize('assistant', len(failures))}. No settings file was changed. "
+        "Fix or remove the listed file(s) and re-run:"
+    )
+    for failure in failures:
+        ui.display_error(
+            f"  {failure.display_names} ({failure.settings_path}): {failure.reason}"
+        )
+
+
 def install_all_agent_hooks(
     only: Sequence[str] = (),
     exclude: Sequence[str] = (),
@@ -490,8 +851,15 @@ def install_all_agent_hooks(
 
     This is the engine behind ``ggshield machine setup``: one command that
     configures all detected AI coding assistants instead of one per agent.
-    Per-agent results are printed by :func:`install_hooks`; the returned summary
-    counts how many agents were configured and how many failed.
+
+    The batch is all-or-nothing: every settings file is first read, parsed,
+    merged and rendered in memory (staging), and each target is checked for
+    writability. Only when all targets stage cleanly are they committed
+    together, each through an atomic temp-file rename. If staging fails for any
+    target, nothing is written and every failing assistant and settings file is
+    reported; if a write fails despite the checks, the files already written are
+    restored to their previous bytes. Re-running is therefore safe: it finds the
+    hook it previously wrote and never adds a second copy.
     """
     agents = select_agents(only, exclude)
     if not agents:
@@ -508,13 +876,53 @@ def install_all_agent_hooks(
         + ", ".join(agent.display_name for agent in agents)
     )
 
-    summary = SetupSummary()
-    for agent in agents:
-        if install_hooks(name=agent.name, mode="global", force=force) == 0:
-            summary.configured += 1
-        else:
-            summary.failed += 1
-    return summary
+    # Phase 1: stage every target. A failure here is a report, not an abort:
+    # collect all of them so one run names every file the user must fix.
+    staged_installs: List[StagedInstall] = []
+    failures: List[HookTargetFailure] = []
+    for settings_path, group in _group_agents_by_settings(agents, "global"):
+        names = _display_names(group)
+        try:
+            staged_installs.append(_stage_agents(group, "global", force))
+        except UnexpectedError as exc:
+            # The message already carries the path and the fix.
+            failures.append(HookTargetFailure(names, settings_path, str(exc)))
+        except OSError as exc:
+            failures.append(
+                HookTargetFailure(
+                    names, settings_path, f"could not access the settings: {exc}"
+                )
+            )
+
+    if failures:
+        _report_staging_failures(failures)
+        return SetupSummary(configured=0, failed=len(failures), failures=failures)
+
+    # Phase 2: commit all targets. A failure here has already been rolled back
+    # by the time commit_staged_installs raises.
+    try:
+        commit_staged_installs(staged_installs)
+    except HookCommitError as exc:
+        names = _display_names(exc.agents)
+        failure = HookTargetFailure(names, exc.settings_path, exc.reason)
+        ui.display_error(
+            f"Failed to write the settings for {names} ({exc.settings_path}): "
+            f"{exc.reason}. Every other settings file was restored to its "
+            "previous state, so no AI hook configuration changed."
+        )
+        return SetupSummary(configured=0, failed=1, failures=[failure])
+
+    for staged in staged_installs:
+        for agent in staged.agents:
+            _report_install_result(
+                agent,
+                staged.settings_path,
+                staged.stats_for(agent),
+                "global",
+            )
+
+    configured = sum(len(staged.agents) for staged in staged_installs)
+    return SetupSummary(configured=configured, failed=0)
 
 
 def _is_interactive() -> bool:

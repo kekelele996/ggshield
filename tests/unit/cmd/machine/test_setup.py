@@ -9,8 +9,11 @@ from pygitguardian.models import HealthCheckResponse
 
 from ggshield.__main__ import cli
 from ggshield.cmd.install import _hook_body, hook_is_outdated
+from ggshield.core.errors import UnexpectedError
 from ggshield.verticals.ai.installation import (
+    InstallationStats,
     SetupSummary,
+    StagedInstall,
     install_all_agent_hooks,
     select_agents,
 )
@@ -61,6 +64,9 @@ class _FakeAgent:
     def is_present(self) -> bool:
         return self._present
 
+    def settings_path(self, mode):
+        return Path(self.name) / "settings.json"
+
 
 class TestSelectAgents:
     def test_defaults_to_detected_agents(self):
@@ -87,28 +93,52 @@ class TestSelectAgents:
 
 
 class TestInstallAllAgentHooks:
-    @patch("ggshield.verticals.ai.installation.install_hooks", return_value=0)
-    def test_configures_every_detected_agent(self, mock_install):
+    @staticmethod
+    def _fake_staged(group):
+        return StagedInstall(
+            agents=list(group),
+            settings_path=Path("/tmp/fake-settings.json"),
+            new_config={},
+            rendered="",
+            stats_by_agent={agent.name: InstallationStats() for agent in group},
+        )
+
+    @patch("ggshield.verticals.ai.installation._report_install_result")
+    @patch("ggshield.verticals.ai.installation.commit_staged_installs")
+    @patch("ggshield.verticals.ai.installation._stage_agents")
+    def test_configures_every_detected_agent(
+        self, mock_stage, mock_commit, mock_report
+    ):
         fakes = {"a": _FakeAgent("a", True), "b": _FakeAgent("b", True)}
+        mock_stage.side_effect = lambda group, mode, force: self._fake_staged(group)
         with patch.dict(AGENTS_PATH, fakes, clear=True):
             summary = install_all_agent_hooks()
-        assert summary == SetupSummary(configured=2, failed=0)
-        assert mock_install.call_count == 2
+        assert summary == SetupSummary(configured=2, failed=0, failures=[])
+        # Every target is staged first, then committed in a single transaction.
+        assert mock_stage.call_count == 2
+        mock_commit.assert_called_once()
+        assert len(mock_commit.call_args.args[0]) == 2
 
-    @patch("ggshield.verticals.ai.installation.install_hooks", return_value=0)
-    def test_no_detected_agents_does_nothing(self, mock_install):
+    @patch("ggshield.verticals.ai.installation._stage_agents")
+    def test_no_detected_agents_does_nothing(self, mock_stage):
         fakes = {"a": _FakeAgent("a", False)}
         with patch.dict(AGENTS_PATH, fakes, clear=True):
             summary = install_all_agent_hooks()
-        assert summary == SetupSummary(configured=0, failed=0)
-        mock_install.assert_not_called()
+        assert summary == SetupSummary(configured=0, failed=0, failures=[])
+        mock_stage.assert_not_called()
 
-    @patch("ggshield.verticals.ai.installation.install_hooks", return_value=1)
-    def test_counts_failures(self, mock_install):
+    @patch("ggshield.verticals.ai.installation.commit_staged_installs")
+    @patch("ggshield.verticals.ai.installation._stage_agents")
+    def test_staging_failure_aborts_before_the_commit(self, mock_stage, mock_commit):
         fakes = {"a": _FakeAgent("a", True)}
+        mock_stage.side_effect = UnexpectedError("Failed to parse /x: bad json")
         with patch.dict(AGENTS_PATH, fakes, clear=True):
             summary = install_all_agent_hooks(only=("a",))
-        assert summary == SetupSummary(configured=0, failed=1)
+        assert summary.configured == 0
+        assert summary.failed == 1
+        assert len(summary.failures) == 1
+        # Nothing staged cleanly: the commit phase never runs.
+        mock_commit.assert_not_called()
 
 
 class TestMachineSetupCommand:

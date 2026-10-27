@@ -17,14 +17,19 @@ else:
     import tomli as tomllib
 
 from ggshield.core.errors import UnexpectedError
-from ggshield.verticals.ai.agents import Claude, Codex, Copilot, Cursor, Vibe
+from ggshield.verticals.ai.agents import Claude, Codex, Copilot, Cursor, Vibe, VSCode
 from ggshield.verticals.ai.installation import (
     AgentHookStatus,
+    HookCommitError,
     InstallationStats,
+    StagedInstall,
     _fill_dict,
+    _group_agents_by_settings,
     ai_hook_posture,
     are_hooks_installed_globally,
     build_hook_command,
+    commit_staged_installs,
+    install_all_agent_hooks,
     install_hooks,
 )
 
@@ -354,6 +359,38 @@ class TestFillDict:
             ]
         }
         assert stats == InstallationStats(added=2, already_present=0)
+
+    def test_item_appended_earlier_in_the_same_loop_is_relocated(self):
+        """Two template items the locator identifies as the same slot must not
+        each append their own copy. A stale candidate snapshot used to append a
+        second entry next to the first one -- which is how a re-run stacked
+        duplicate ggshield hooks."""
+        config: Dict[str, Any] = {"hooks": []}
+        item = {"name": "ggshield", "command": "<COMMAND>"}
+        template = {"hooks": [dict(item), dict(item)]}
+
+        def by_name(candidates, template_item):
+            return next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate.get("name") == "ggshield"
+                ),
+                None,
+            )
+
+        stats = _fill_dict(
+            config,
+            template,
+            COMMAND,
+            overwrite=False,
+            stats=InstallationStats(added=0, already_present=0),
+            locator=by_name,
+        )
+
+        assert config == {"hooks": [{"name": "ggshield", "command": COMMAND}]}
+        # The single command slot is counted once.
+        assert stats.added == 1
 
 
 class TestFlavorSettingsProperties:
@@ -1174,3 +1211,296 @@ class TestAiHookPosture:
         fakes = {"a": _FakeAgent("a", "Agent A", present=False)}
         with patch.dict(self.AGENTS_PATH, fakes, clear=True), patch(self.HOOKS_PATH):
             assert ai_hook_posture() == []
+
+
+#: True when permission-based tests cannot work (root bypasses the mode bits,
+#: Windows has no POSIX modes).
+_SKIP_PERMISSION_TESTS = os.name == "nt" or (
+    hasattr(os, "geteuid") and os.geteuid() == 0
+)
+
+
+@pytest.fixture
+def fake_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the installer's home directory at an empty temp directory."""
+    monkeypatch.setattr(
+        "ggshield.verticals.ai.installation.get_user_home_dir", lambda: tmp_path
+    )
+    return tmp_path
+
+
+def _ggshield_command_count(path: Path) -> int:
+    """How many ggshield hook commands a settings file ended up with."""
+    return path.read_text().count("secret scan ai-hook")
+
+
+def _no_temp_files_left(root: Path) -> bool:
+    return not [
+        path
+        for path in root.rglob("*")
+        if "ggshield-tmp" in path.name or "ggshield-backup" in path.name
+    ]
+
+
+class TestGroupAgentsBySettings:
+    def test_copilot_and_vscode_share_one_settings_file(self, fake_home: Path):
+        groups = _group_agents_by_settings([Copilot(), VSCode()], "global")
+        assert len(groups) == 1
+        path, agents = groups[0]
+        assert path == fake_home / ".copilot" / "hooks" / "hooks.json"
+        assert {agent.name for agent in agents} == {"copilot", "vscode"}
+
+    def test_distinct_agents_remain_separate_targets(self, fake_home: Path):
+        groups = _group_agents_by_settings([Claude(), Cursor()], "global")
+        assert len(groups) == 2
+        assert [path.name for path, _ in groups] == ["settings.json", "hooks.json"]
+
+
+class TestBatchInstallAtomicity:
+    """The multi-assistant install checks and stages everything, then commits
+    all targets together -- never a partial batch."""
+
+    def test_bad_settings_for_one_agent_changes_nothing(
+        self, fake_home: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        """GIVEN a second assistant's settings file does not parse
+        WHEN the hooks are installed for both
+        THEN the first assistant's file is not created and the bad file is
+        left byte-for-byte untouched, with the failing assistant named"""
+        cursor_settings = fake_home / ".cursor" / "hooks.json"
+        cursor_settings.parent.mkdir(parents=True)
+        cursor_settings.write_text("{ invalid json")
+        claude_settings = fake_home / ".claude" / "settings.json"
+
+        summary = install_all_agent_hooks(only=("claude-code", "cursor"))
+
+        assert summary.configured == 0
+        assert summary.failed == 1
+        assert len(summary.failures) == 1
+        assert summary.failures[0].settings_path == cursor_settings
+        assert not claude_settings.exists()
+        assert cursor_settings.read_text() == "{ invalid json"
+        assert _no_temp_files_left(fake_home)
+
+        output = capsys.readouterr().err
+        assert "Cursor" in output
+        assert str(cursor_settings) in output
+        assert "No settings file was changed" in output
+
+    def test_every_bad_target_is_reported_in_one_run(
+        self, fake_home: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        """GIVEN two unparseable settings files and one healthy assistant
+        WHEN the batch runs
+        THEN both failing assistants AND files are named and no file is
+        written -- the run is not aborted by the first failure"""
+        cursor_settings = fake_home / ".cursor" / "hooks.json"
+        cursor_settings.parent.mkdir(parents=True)
+        cursor_settings.write_text("{ invalid json")
+        codex_settings = fake_home / ".codex" / "hooks.json"
+        codex_settings.parent.mkdir(parents=True)
+        codex_settings.write_text("not json at all")
+        claude_settings = fake_home / ".claude" / "settings.json"
+
+        summary = install_all_agent_hooks(only=("claude-code", "codex", "cursor"))
+
+        assert summary.configured == 0
+        assert summary.failed == 2
+        assert {failure.settings_path for failure in summary.failures} == {
+            cursor_settings,
+            codex_settings,
+        }
+        assert not claude_settings.exists()
+        output = capsys.readouterr().err
+        assert "Cursor" in output and "Codex" in output
+
+    @pytest.mark.skipif(
+        _SKIP_PERMISSION_TESTS,
+        reason="needs an unprivileged user with POSIX permission bits",
+    )
+    def test_unwritable_target_aborts_before_the_first_write(
+        self, fake_home: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        """GIVEN one settings directory is not writable
+        WHEN the batch stages the targets
+        THEN the other assistant is never written and the unwritable target is
+        reported with its file path"""
+        cursor_dir = fake_home / ".cursor"
+        cursor_dir.mkdir()
+        cursor_dir.chmod(0o500)
+        claude_settings = fake_home / ".claude" / "settings.json"
+        try:
+            summary = install_all_agent_hooks(only=("claude-code", "cursor"))
+        finally:
+            # Restore permissions so pytest can tear tmp_path down.
+            cursor_dir.chmod(0o700)
+
+        assert summary.configured == 0
+        assert summary.failed == 1
+        assert summary.failures[0].settings_path == (
+            fake_home / ".cursor" / "hooks.json"
+        )
+        assert not claude_settings.exists()
+        assert "Cursor" in capsys.readouterr().err
+
+    def test_write_failure_rolls_every_already_written_file_back(
+        self, fake_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """GIVEN the first target commits and the second fails to rename
+        WHEN the batch commits
+        THEN the first file is restored byte-for-byte, the second never
+        appears, and no temp/backup file is left behind"""
+        real_replace = os.replace
+
+        claude_settings = fake_home / ".claude" / "settings.json"
+        claude_settings.parent.mkdir(parents=True)
+        original = json.dumps(
+            {"keep_me": True, "hooks": {"PreToolUse": [{"matcher": "Bash"}]}}
+        )
+        claude_settings.write_text(original)
+        cursor_settings = fake_home / ".cursor" / "hooks.json"
+
+        def replace_failing_on_cursor(src: str, dst: str, *args: Any) -> None:
+            # The rollback renames the Claude backup back into place: only the
+            # cursor commit itself must fail.
+            if str(dst) == str(cursor_settings):
+                raise PermissionError("simulated write failure")
+            real_replace(src, dst, *args)
+
+        monkeypatch.setattr(os, "replace", replace_failing_on_cursor)
+
+        summary = install_all_agent_hooks(only=("claude-code", "cursor"))
+
+        assert summary.configured == 0
+        assert summary.failed == 1
+        assert summary.failures[0].settings_path == cursor_settings
+        assert claude_settings.read_text() == original
+        assert not cursor_settings.exists()
+        assert _no_temp_files_left(fake_home)
+
+    def test_failed_run_followed_by_a_fix_stays_idempotent(
+        self, fake_home: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        """The reported incident end to end: a first run aborts on a bad file,
+        the user fixes that file, and re-running installs exactly one ggshield
+        entry per hook -- a third run adds none."""
+        cursor_settings = fake_home / ".cursor" / "hooks.json"
+        cursor_settings.parent.mkdir(parents=True)
+        cursor_settings.write_text("{ invalid json")
+        claude_settings = fake_home / ".claude" / "settings.json"
+
+        first = install_all_agent_hooks(only=("claude-code", "cursor"))
+        assert first.failed == 1 and not claude_settings.exists()
+
+        # The user repairs the assistant's settings, keeping a foreign hook.
+        cursor_settings.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "hooks": {"preToolUse": [{"command": "other-tool"}]},
+                }
+            )
+        )
+
+        second = install_all_agent_hooks(only=("claude-code", "cursor"))
+        assert second.configured == 2 and second.failed == 0
+        assert _ggshield_command_count(claude_settings) == 3
+        # Three ggshield entries (one per event), the foreign command preserved.
+        cursor_config = json.loads(cursor_settings.read_text())
+        assert _ggshield_command_count(cursor_settings) == 3
+        pre_tool_commands = cursor_config["hooks"]["preToolUse"]
+        assert {"command": "other-tool"} in pre_tool_commands
+
+        third = install_all_agent_hooks(only=("claude-code", "cursor"))
+        assert third.configured == 2 and third.failed == 0
+        assert _ggshield_command_count(claude_settings) == 3
+        assert _ggshield_command_count(cursor_settings) == 3
+        assert "already installed" in capsys.readouterr().out
+
+    def test_assistants_sharing_one_settings_file_install_it_once(
+        self, fake_home: Path
+    ):
+        """Copilot CLI and VSCode configure the same file: one staged write, a
+        single ggshield entry per event, and both assistants counted."""
+        shared = fake_home / ".copilot" / "hooks" / "hooks.json"
+
+        first = install_all_agent_hooks(only=("copilot", "vscode"))
+        assert first.configured == 2 and first.failed == 0
+        config = json.loads(shared.read_text())
+        for event in ("PreToolUse", "PostToolUse", "UserPromptSubmit"):
+            commands = [
+                hook["command"]
+                for block in config["hooks"][event]
+                for hook in block["hooks"]
+            ]
+            assert sum("ggshield" in command for command in commands) == 1
+
+        # A second run must not stack a second set of entries.
+        second = install_all_agent_hooks(only=("copilot", "vscode"))
+        assert second.configured == 2 and second.failed == 0
+        assert _ggshield_command_count(shared) == 3
+        assert _no_temp_files_left(fake_home)
+
+
+class TestTransactionalSingleInstall:
+    def test_write_failure_leaves_the_existing_file_untouched(
+        self, fake_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """GIVEN an existing settings file
+        WHEN the atomic rename fails
+        THEN install_hooks raises and the file keeps its original bytes"""
+        settings = fake_home / ".cursor" / "hooks.json"
+        settings.parent.mkdir(parents=True)
+        original = json.dumps({"version": 1, "other_key": "keep_me"})
+        settings.write_text(original)
+
+        real_replace = os.replace
+        calls = {"count": 0}
+
+        def fail_the_commit_only(src: str, dst: str, *args: Any) -> None:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                # First rename is the commit; the next one is the rollback.
+                raise PermissionError("simulated write failure")
+            real_replace(src, dst, *args)
+
+        monkeypatch.setattr(os, "replace", fail_the_commit_only)
+
+        with pytest.raises(UnexpectedError, match="Failed to write"):
+            install_hooks("cursor", mode="global")
+
+        assert settings.read_text() == original
+        assert _no_temp_files_left(fake_home)
+
+    def test_new_file_is_removed_when_its_rename_fails(
+        self, fake_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A brand-new settings file whose commit fails leaves no file behind:
+        there is nothing to restore to, so rollback deletes it."""
+
+        def fail_every_rename(src: str, dst: str) -> None:
+            raise PermissionError("simulated write failure")
+
+        monkeypatch.setattr(os, "replace", fail_every_rename)
+
+        with pytest.raises(UnexpectedError, match="Failed to write"):
+            install_hooks("claude-code", mode="global")
+
+        assert not (fake_home / ".claude" / "settings.json").exists()
+        assert _no_temp_files_left(fake_home)
+
+    def test_commit_error_carries_the_target(self):
+        staged = StagedInstall(
+            agents=[Claude()],
+            settings_path=Path("/tmp/.claude/settings.json"),
+            new_config={},
+            rendered="",
+            stats_by_agent={},
+        )
+        error = HookCommitError([Claude()], staged.settings_path, "boom")
+        assert error.settings_path == staged.settings_path
+        assert error.agents[0].name == "claude-code"
+
+    def test_commit_no_targets_is_a_noop(self):
+        # Nothing staged: nothing can fail and nothing is written.
+        commit_staged_installs([])

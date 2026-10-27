@@ -100,6 +100,12 @@ def setup_cmd(
     and a honeytoken to detect endpoint intrusion. Safe to re-run — it adds what
     is missing and leaves existing entries untouched.
 
+    The AI hooks are installed all-or-nothing: every assistant's settings are
+    checked and staged first, and they are only written when all of them can be
+    updated. If one cannot, no settings file changes and each failing assistant
+    and file is listed; a failure while writing rolls every other file back to
+    its previous state.
+
     Each protection is on by default; drop one with `--no-ai-hooks`,
     `--no-git-hooks`, or `--no-honeytokens`. `--agent` / `--exclude-agent`
     narrow which assistants get the AI hook. When run as root (or with
