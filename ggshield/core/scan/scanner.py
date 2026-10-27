@@ -13,6 +13,7 @@ from ggshield.core.config.user_config import SecretConfig
 from ggshield.core.scanner_ui import ScannerUI
 
 from . import Scannable
+from .coverage import ScanCoverage
 
 
 class SecretProtocol(Protocol):
@@ -80,4 +81,5 @@ class ScannerProtocol(Protocol):
         files: Iterable[Scannable],
         scanner_ui: ScannerUI,
         scan_threads: Optional[int] = None,
+        coverage: Optional[ScanCoverage] = None,
     ) -> ResultsProtocol: ...

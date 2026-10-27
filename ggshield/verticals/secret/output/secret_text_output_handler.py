@@ -6,6 +6,11 @@ from pygitguardian.client import VERSIONS
 
 from ggshield.core.constants import IncidentStatus
 from ggshield.core.lines import Line, get_offset, get_padding
+from ggshield.core.scan.coverage import (
+    CATEGORY_LABELS,
+    CATEGORY_ORDER,
+    ScanCoverage,
+)
 from ggshield.core.text_utils import (
     STYLE,
     clip_long_line,
@@ -86,6 +91,10 @@ class SecretTextOutputHandler(SecretOutputHandler):
                 f"GitGuardian dashboard and you used the `--ignore-known-secrets` option.\n"
             )
             # TODO: display that using --all-secrets will display those
+
+        if scan.coverage is not None:
+            scan_buf.write(format_coverage_summary(scan.coverage, verbose=self.verbose))
+
         return scan_buf.getvalue()
 
     def process_scan_results(self, scan: SecretScanCollection) -> str:
@@ -347,6 +356,55 @@ def no_new_leak_message() -> str:
     Build a message if no new secret is found.
     """
     return format_text("\nNo new secrets have been found\n", STYLE["no_secret"])
+
+
+# A repository can contain thousands of files: cap how many are listed in the
+# text summary, the complete list is available in the JSON output.
+MAX_COVERAGE_FILES_IN_TEXT = 100
+
+
+def _write_coverage_file_list(buf: StringIO, files: List[str], indent: int) -> None:
+    for name in files[:MAX_COVERAGE_FILES_IN_TEXT]:
+        buf.write(" " * indent + f"- {name}\n")
+    remaining = len(files) - MAX_COVERAGE_FILES_IN_TEXT
+    if remaining > 0:
+        buf.write(
+            " " * indent + f"... and {remaining} more {pluralize('file', remaining)}"
+            " (use --json for the complete list)\n"
+        )
+
+
+def format_coverage_summary(coverage: ScanCoverage, verbose: bool) -> str:
+    """
+    Build the coverage summary: how many files were scanned and how many were
+    not checked, grouped by reason category. File names are only listed in
+    verbose mode (the JSON output always contains them).
+    """
+    buf = StringIO()
+    buf.write("\n")
+    buf.write(
+        f"{format_text('Coverage summary', STYLE['heading'])}: "
+        f"{coverage.total_count} {pluralize('file', coverage.total_count)} total\n"
+    )
+    buf.write(f"  Scanned: {coverage.scanned_count}\n")
+    if verbose:
+        _write_coverage_file_list(buf, coverage.scanned_files, indent=4)
+
+    buf.write(f"  Not checked: {coverage.skipped_count}\n")
+    for category in CATEGORY_ORDER:
+        count = coverage.skipped_count_for(category)
+        if count == 0:
+            continue
+        buf.write(f"    - {CATEGORY_LABELS[category]}: {count}\n")
+        if verbose:
+            for reason, files in coverage.reasons_for(category):
+                buf.write(f"      {reason.label} ({len(files)}):\n")
+                _write_coverage_file_list(buf, files, indent=8)
+
+    if coverage.skipped_count > 0 and not verbose:
+        buf.write("    Re-run with --verbose to see the file names.\n")
+
+    return buf.getvalue()
 
 
 def format_line_with_secret(

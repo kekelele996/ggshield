@@ -1,9 +1,10 @@
 from pathlib import Path
-from typing import List, Pattern, Set, Tuple, Union
+from typing import List, Optional, Pattern, Set, Tuple, Union
 
 from ggshield.core.errors import UnexpectedError
 from ggshield.utils.files import ListFilesMode, is_path_binary, list_files, url_for_path
 
+from .coverage import ScanCoverage, SkipReason
 from .scannable import Scannable
 
 
@@ -54,22 +55,46 @@ def create_files_from_paths(
     paths: List[Path],
     exclusion_regexes: Set[Pattern[str]],
     list_files_mode: ListFilesMode = ListFilesMode.GIT_COMMITTED_OR_STAGED,
+    coverage: Optional[ScanCoverage] = None,
 ) -> Tuple[List[Scannable], List[Path]]:
     """
     Create File instances for `paths` and return them, as well as a list of the ignored
     paths found in `paths`.
+
+    When `coverage` is provided, files not returned because they are excluded
+    by a rule or because their extension is known to be binary are recorded on
+    it.
     """
-    filepaths = list_files(
-        paths,
-        exclusion_regexes,
-        list_files_mode=list_files_mode,
-    )
+    if coverage is not None:
+        # The skip classification lives here in the core layer: the utils
+        # layer only reports which paths it drops, without depending on core.
+        def on_excluded(path: Path) -> None:
+            coverage.record_skipped(SkipReason.EXCLUDED_PATH, str(path))
+
+        def on_gitignored(path: Path) -> None:
+            coverage.record_skipped(SkipReason.GITIGNORED, str(path))
+
+        filepaths = list_files(
+            paths,
+            exclusion_regexes,
+            list_files_mode=list_files_mode,
+            on_excluded=on_excluded,
+            on_gitignored=on_gitignored,
+        )
+    else:
+        filepaths = list_files(
+            paths,
+            exclusion_regexes,
+            list_files_mode=list_files_mode,
+        )
 
     files: List[Scannable] = []
     binary_paths: List[Path] = []
     for path in filepaths:
         if is_path_binary(path):
             binary_paths.append(path)
+            if coverage is not None:
+                coverage.record_skipped(SkipReason.BINARY, str(path))
             continue
 
         files.append(File(path))

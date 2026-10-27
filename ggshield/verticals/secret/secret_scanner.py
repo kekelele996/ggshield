@@ -22,7 +22,13 @@ from ggshield.core.errors import (
     UnexpectedError,
     handle_api_error,
 )
-from ggshield.core.scan import DecodeError, ScanContext, Scannable
+from ggshield.core.scan import (
+    DecodeError,
+    ScanContext,
+    ScanCoverage,
+    Scannable,
+    SkipReason,
+)
 from ggshield.core.scan.scannable import NonSeekableFileError
 from ggshield.core.scanner_ui.scanner_ui import ScannerUI
 from ggshield.core.text_utils import pluralize
@@ -72,11 +78,14 @@ class SecretScanner:
         files: Iterable[Scannable],
         scanner_ui: ScannerUI,
         scan_threads: Optional[int] = None,
+        coverage: Optional[ScanCoverage] = None,
     ) -> Results:
         """
         Starts the scan, using at most `scan_threads`. If `scan_threads` is not set,
         defaults to MAX_WORKERS.
         Reports progress through `scanner_ui`.
+        When `coverage` is provided, records on it which files were scanned and
+        which were skipped (and why).
         Returns a Results instance.
         """
         if scan_threads is None:
@@ -90,6 +99,7 @@ class SecretScanner:
                 executor,
                 files,
                 scanner_ui,
+                coverage,
             )
 
             return self._collect_results(scanner_ui, chunks_for_futures)
@@ -145,6 +155,7 @@ class SecretScanner:
         executor: concurrent.futures.ThreadPoolExecutor,
         scannables: Iterable[Scannable],
         scanner_ui: ScannerUI,
+        coverage: Optional[ScanCoverage] = None,
     ) -> Dict[ScanFuture, List[Scannable]]:
         """
         Start all scans, return a tuple containing:
@@ -171,25 +182,36 @@ class SecretScanner:
         logging.debug("max_doc_size=%d", maximum_document_size)
         logging.debug("max_docs=%d", maximum_documents_per_scan)
         for scannable in scannables:
+            name = scannable.filename
             try:
                 if scannable.is_longer_than(maximum_document_size):
                     scanner_ui.on_skipped(
                         scannable, f"content is over {maximum_document_size:,} bytes"
                     )
+                    if coverage:
+                        coverage.record_skipped(SkipReason.TOO_LARGE, name)
                     continue
                 content = scannable.content
             except DecodeError:
                 scanner_ui.on_skipped(scannable, "can't detect encoding")
+                if coverage:
+                    coverage.record_skipped(SkipReason.ENCODING, name)
                 continue
             except NonSeekableFileError:
                 scanner_ui.on_skipped(scannable, "file cannot be seeked")
+                if coverage:
+                    coverage.record_skipped(SkipReason.NON_SEEKABLE, name)
                 continue
             except FileNotFoundError:
                 scanner_ui.on_skipped(scannable, "file not found")
+                if coverage:
+                    coverage.record_skipped(SkipReason.FILE_NOT_FOUND, name)
                 continue
 
             if not content:
                 scanner_ui.on_skipped(scannable, "")
+                if coverage:
+                    coverage.record_skipped(SkipReason.EMPTY, name)
                 continue
 
             document_payload_size = self._document_payload_size(scannable)
@@ -199,6 +221,8 @@ class SecretScanner:
                     f"encoded content is over the {max_payload_size:,} bytes"
                     " payload limit",
                 )
+                if coverage:
+                    coverage.record_skipped(SkipReason.PAYLOAD_LIMIT, name)
                 continue
 
             if chunk and (
@@ -211,6 +235,8 @@ class SecretScanner:
                 chunk_payload_size = 0
             chunk.append(scannable)
             chunk_payload_size += document_payload_size
+            if coverage:
+                coverage.record_scanned(name)
         if chunk:
             future = self._scan_chunk(executor, chunk)
             chunks_for_futures[future] = chunk

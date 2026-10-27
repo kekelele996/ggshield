@@ -35,6 +35,10 @@ class SecretJSONOutputHandler(SecretOutputHandler):
 
         if top:
             scan_dict["secrets_engine_version"] = VERSIONS.secrets_engine_version
+            if scan.coverage is not None:
+                # The coverage dict always contains the complete file lists, so
+                # the report can be used to locate files which were not checked.
+                scan_dict["coverage"] = scan.coverage.to_dict()
 
         if scan.results:
             for result in scan.results.results:

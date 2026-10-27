@@ -468,6 +468,124 @@ class TestScanDirectory:
             ]
         )
 
+    @patch("pygitguardian.GGClient.multi_content_scan")
+    @my_vcr.use_cassette("test_scan_file")
+    def test_scan_path_coverage_summary_text(
+        self, scan_mock: Mock, cli_fs_runner: CliRunner
+    ):
+        """
+        GIVEN a scanned file, an excluded file and a binary file
+        WHEN running a recursive path scan
+        THEN the output ends with a coverage summary counting each file once
+        AND file names only appear in verbose mode
+        AND the exit code is still 0
+        """
+        scan_result = MultiScanResult([])
+        scan_result.status_code = 200
+        scan_mock.return_value = scan_result
+
+        os.makedirs("tree", exist_ok=True)
+        write_text(Path("tree/keep.txt"), "This is a file with no secrets.")
+        write_text(Path("tree/excluded.txt"), "This is a file with no secrets.")
+        Path("tree/logo.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+        base_cmd = [
+            "secret",
+            "scan",
+            "path",
+            "tree",
+            "-r",
+            "-y",
+            "--exclude",
+            "excluded.txt",
+        ]
+
+        # Non-verbose: counts but no file names
+        result = cli_fs_runner.invoke(cli, base_cmd)
+        assert_invoke_ok(result)
+        assert "Coverage summary: 3 files total" in result.output
+        assert "Scanned: 1" in result.output
+        assert "Not checked: 2" in result.output
+        assert "excluded by rules: 1" in result.output
+        assert "content restrictions: 1" in result.output
+        assert "read errors" not in result.output
+        assert "Re-run with --verbose to see the file names." in result.output
+        assert "excluded.txt" not in result.output
+        assert "logo.png" not in result.output
+
+        # Verbose: files can be located
+        verbose_result = cli_fs_runner.invoke(cli, ["-v", *base_cmd])
+        assert_invoke_ok(verbose_result)
+        assert "Scanned: 1" in verbose_result.output
+        assert os.path.join("tree", "keep.txt") in verbose_result.output
+        assert "path matches an exclusion rule (1)" in verbose_result.output
+        assert os.path.join("tree", "excluded.txt") in verbose_result.output
+        assert "binary file (1)" in verbose_result.output
+        assert os.path.join("tree", "logo.png") in verbose_result.output
+
+    @patch("pygitguardian.GGClient.multi_content_scan")
+    @my_vcr.use_cassette("test_scan_file")
+    def test_scan_path_coverage_summary_json(
+        self, scan_mock: Mock, cli_fs_runner: CliRunner
+    ):
+        """
+        GIVEN a scanned file, an excluded file and a binary file
+        WHEN running a recursive JSON path scan
+        THEN the report contains a coverage object with counts and complete
+        file lists, with every file classified exactly once
+        """
+        scan_result = MultiScanResult([])
+        scan_result.status_code = 200
+        scan_mock.return_value = scan_result
+
+        os.makedirs("tree", exist_ok=True)
+        write_text(Path("tree/keep.txt"), "This is a file with no secrets.")
+        write_text(Path("tree/excluded.txt"), "This is a file with no secrets.")
+        Path("tree/logo.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+        cli_fs_runner.mix_stderr = False
+        result = cli_fs_runner.invoke(
+            cli,
+            [
+                "secret",
+                "scan",
+                "--json",
+                "path",
+                "tree",
+                "-r",
+                "-y",
+                "--exclude",
+                "excluded.txt",
+            ],
+        )
+        assert_invoke_ok(result)
+        report = json.loads(result.stdout)
+
+        coverage = report["coverage"]
+        assert coverage["total_files"] == 3
+        assert coverage["scanned_files"] == 1
+        assert coverage["skipped_files"] == 2
+        assert coverage["scanned"][0].endswith(os.path.join("tree", "keep.txt"))
+
+        categories = {c["name"]: c for c in coverage["categories"]}
+        assert categories["rules"]["count"] == 1
+        assert categories["read_error"]["count"] == 0
+        assert categories["content"]["count"] == 1
+
+        rules_reasons = {
+            reason["name"]: reason for reason in categories["rules"]["reasons"]
+        }
+        assert rules_reasons["excluded_path"]["count"] == 1
+        assert rules_reasons["excluded_path"]["files"][0].endswith(
+            os.path.join("tree", "excluded.txt")
+        )
+        content_reasons = {
+            reason["name"]: reason for reason in categories["content"]["reasons"]
+        }
+        assert content_reasons["binary"]["files"][0].endswith(
+            os.path.join("tree", "logo.png")
+        )
+
     @pytest.mark.parametrize("all_secrets", (True, False))
     @pytest.mark.parametrize(
         ("ignored_detectors", "nb_secret", "nb_ignored"),

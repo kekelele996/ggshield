@@ -20,6 +20,7 @@ from ggshield.core.errors import handle_api_error
 from ggshield.core.filter import is_in_ignored_matches
 from ggshield.core.lines import get_lines_from_content
 from ggshield.core.scan import Scannable
+from ggshield.core.scan.coverage import ScanCoverage
 from ggshield.utils.git_shell import Filemode
 from ggshield.verticals.secret.extended_match import ExtendedMatch
 
@@ -275,6 +276,7 @@ class SecretScanCollection:
     scans: Optional[List["SecretScanCollection"]] = None
     optional_header: Optional[str] = None  # To be printed in Text Output
     extra_info: Optional[Dict[str, str]] = None  # To be included in JSON Output
+    coverage: Optional[ScanCoverage] = None  # Scanned/skipped file coverage
 
     def __init__(
         self,
@@ -284,6 +286,7 @@ class SecretScanCollection:
         scans: Optional[List["SecretScanCollection"]] = None,
         optional_header: Optional[str] = None,
         extra_info: Optional[Dict[str, str]] = None,
+        coverage: Optional[ScanCoverage] = None,
     ):
         self.id = str(id)
         self.type = type
@@ -291,6 +294,7 @@ class SecretScanCollection:
         self.scans = scans
         self.optional_header = optional_header
         self.extra_info = extra_info
+        self.coverage = coverage
 
         self.total_secrets_count = sum(
             len(result.secrets) for result in self.get_all_results()

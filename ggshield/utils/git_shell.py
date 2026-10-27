@@ -343,6 +343,13 @@ def git_ls_unstaged(wd: Optional[Union[str, Path]] = None) -> List[str]:
     return unstaged_files
 
 
+def git_ls_ignored(wd: Optional[Union[str, Path]] = None) -> List[str]:
+    # git command to get the list of files ignored by git (listed in .gitignore
+    # or any other gitignore source). Paths are relative to `wd`.
+    cmd = ["ls-files", "--others", "--ignored", "--exclude-standard"]
+    return [path for path in git(cmd, timeout=600, cwd=wd).splitlines() if path]
+
+
 def is_valid_git_commit_ref(ref: str, wd: Optional[Union[str, Path]] = None) -> bool:
     """
     Check if a reference is valid and can be resolved to a commit

@@ -31,9 +31,12 @@ from ggshield.core.errors import (
 from ggshield.core.scan import (
     Commit,
     DecodeError,
+    NonSeekableFileError,
     ScanContext,
+    ScanCoverage,
     ScanMode,
     Scannable,
+    SkipReason,
     StringScannable,
 )
 from ggshield.core.scanner_ui.scanner_ui import ScannerUI
@@ -137,22 +140,27 @@ def test_scan_patch(client, cache, name: str, input_patch: str, expected: Expect
 
 
 @pytest.mark.parametrize(
-    "unscannable_type",
+    "unscannable_type,expected_reason",
     [
-        "EMPTY",
-        "TOO_BIG",
-        "BINARY",
-        "FILE_NOT_FOUND",
+        ("EMPTY", SkipReason.EMPTY),
+        ("TOO_BIG", SkipReason.TOO_LARGE),
+        ("BINARY", SkipReason.ENCODING),
+        ("FILE_NOT_FOUND", SkipReason.FILE_NOT_FOUND),
+        ("NON_SEEKABLE", SkipReason.NON_SEEKABLE),
     ],
 )
-def test_scanner_skips_unscannable_files(client, fs, cache, unscannable_type: str):
+def test_scanner_skips_unscannable_files(
+    client, fs, cache, unscannable_type: str, expected_reason: SkipReason
+):
     """
     GIVEN a Scannable which is not scannable
     WHEN Scanner.scan() is called on it
     THEN it skips it
     AND the progress callback is called
+    AND the coverage tracker classifies it under the right reason
     """
     mock = Mock(spec=Scannable)
+    mock.filename = unscannable_type.lower()
     if unscannable_type == "EMPTY":
         mock.is_longer_than.return_value = False
         mock.content = ""
@@ -162,8 +170,11 @@ def test_scanner_skips_unscannable_files(client, fs, cache, unscannable_type: st
         mock.is_longer_than.side_effect = DecodeError
     elif unscannable_type == "FILE_NOT_FOUND":
         mock.is_longer_than.side_effect = FileNotFoundError
+    elif unscannable_type == "NON_SEEKABLE":
+        mock.is_longer_than.side_effect = NonSeekableFileError
 
     scanner_ui = Mock(spec=ScannerUI)
+    coverage = ScanCoverage()
 
     scanner = SecretScanner(
         client=client,
@@ -175,9 +186,12 @@ def test_scanner_skips_unscannable_files(client, fs, cache, unscannable_type: st
         check_api_key=False,
         secret_config=SecretConfig(),
     )
-    scanner.scan([mock], scanner_ui=scanner_ui)
+    scanner.scan([mock], scanner_ui=scanner_ui, coverage=coverage)
 
     scanner_ui.on_skipped.assert_called_once()
+    assert coverage.scanned_files == []
+    assert coverage.skipped_files(expected_reason) == [unscannable_type.lower()]
+    assert coverage.skipped_count == 1
 
 
 def test_handle_scan_error_api_key():
@@ -764,3 +778,31 @@ def test_document_too_big_for_any_payload_is_skipped(
     assert [[d["filename"] for d in documents] for documents in sent] == [["small"]]
     scanner_ui.on_skipped.assert_called_once_with(oversized, ANY)
     assert "payload" in scanner_ui.on_skipped.call_args.args[1]
+
+
+@patch("pygitguardian.GGClient.multi_content_scan")
+def test_scan_records_scanned_files_in_coverage(scan_mock: Mock, client):
+    """
+    GIVEN scannables, one of which is empty
+    WHEN scanner.scan() is called with a coverage tracker
+    THEN files actually sent to the API are recorded as scanned, the empty one
+    as skipped, and no file appears in both groups
+    """
+    scanned = StringScannable(url="scanned", content="hello")
+    empty = StringScannable(url="empty", content="")
+    scan_mock.side_effect = _clean_multi_scan_result
+
+    coverage = ScanCoverage()
+    scanner = SecretScanner(
+        client=client,
+        cache=Cache(),
+        scan_context=ScanContext(scan_mode=ScanMode.PATH, command_path="ggshield"),
+        check_api_key=False,
+        secret_config=SecretConfig(),
+    )
+    scanner.scan([scanned, empty], scanner_ui=Mock(), coverage=coverage)
+
+    assert coverage.scanned_files == ["scanned"]
+    assert coverage.skipped_files(SkipReason.EMPTY) == ["empty"]
+    assert coverage.total_count == 2
+    assert coverage.scanned_count + coverage.skipped_count == coverage.total_count

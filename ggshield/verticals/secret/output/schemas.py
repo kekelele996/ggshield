@@ -58,3 +58,7 @@ class JSONScanCollectionSchema(BaseSchema):
     total_incidents = fields.Integer(required=True)
     total_occurrences = fields.Integer(required=True)
     secrets_engine_version = fields.String(required=False)
+    # Coverage summary (scanned/skipped files with their reason), only present
+    # on scans which track coverage. Missing from the input dict: omitted from
+    # the dump.
+    coverage = fields.Raw(required=False, allow_none=True)

@@ -160,3 +160,102 @@ def test_get_gitignored_files(tmp_path):
     )
 
     assert file_paths == set()
+
+
+def test_list_files_reports_excluded_files(tmp_path):
+    """
+    GIVEN files matching exclusion regexes
+    WHEN listing a directory with on_excluded/on_gitignored callbacks
+    THEN excluded files are reported through on_excluded
+    AND the other files are returned as usual
+    """
+    write_text(str(tmp_path / "keep.txt"), "keep")
+    write_text(str(tmp_path / "ignore" / "drop.txt"), "drop")
+
+    excluded = []
+    targets = list_files(
+        paths=[tmp_path],
+        exclusion_regexes={re.compile("ignore/.*")},
+        list_files_mode=ListFilesMode.ALL,
+        on_excluded=excluded.append,
+    )
+
+    assert targets == {tmp_path / "keep.txt"}
+    assert excluded == [tmp_path / "ignore" / "drop.txt"]
+
+
+def test_list_files_reports_gitignored_direct_file(tmp_path):
+    """
+    GIVEN a gitignored file passed as a direct path
+    WHEN listing it with ALL_BUT_GITIGNORED and callbacks
+    THEN it is reported through on_gitignored
+    """
+    Repository.create(tmp_path)
+    write_text(str(tmp_path / ".gitignore"), "file.txt")
+    ignored_file = tmp_path / "file.txt"
+    write_text(str(ignored_file), "")
+
+    gitignored = []
+    targets = list_files(
+        paths=[ignored_file],
+        exclusion_regexes=set(),
+        list_files_mode=ListFilesMode.ALL_BUT_GITIGNORED,
+        on_gitignored=gitignored.append,
+    )
+
+    assert targets == set()
+    assert gitignored == [ignored_file]
+
+
+def test_list_files_reports_gitignored_files_in_directory(tmp_path):
+    """
+    GIVEN a git directory containing gitignored files
+    WHEN listing it with ALL_BUT_GITIGNORED and callbacks
+    THEN the gitignored files are reported, one per file
+    AND non-ignored files are returned as usual
+    """
+    Repository.create(tmp_path)
+    write_text(str(tmp_path / ".gitignore"), "ignored_dir/*\nignored.txt\n")
+    write_text(str(tmp_path / "tracked.txt"), "tracked")
+    write_text(str(tmp_path / "ignored.txt"), "ignored")
+    write_text(str(tmp_path / "ignored_dir" / "deep.txt"), "ignored")
+
+    gitignored = []
+    targets = list_files(
+        paths=[tmp_path],
+        exclusion_regexes=set(),
+        list_files_mode=ListFilesMode.ALL_BUT_GITIGNORED,
+        on_gitignored=gitignored.append,
+    )
+
+    assert targets == {tmp_path / "tracked.txt", tmp_path / ".gitignore"}
+    assert sorted(gitignored) == sorted(
+        [tmp_path / "ignored.txt", tmp_path / "ignored_dir" / "deep.txt"]
+    )
+
+
+def test_list_files_gitignored_file_matching_exclusion_rule_is_reported_as_excluded(
+    tmp_path,
+):
+    """
+    GIVEN a gitignored file which also matches an exclusion regex
+    WHEN listing with callbacks
+    THEN it is reported through on_excluded, not on_gitignored (one reason
+    only)
+    """
+    Repository.create(tmp_path)
+    write_text(str(tmp_path / ".gitignore"), "ignored.txt\n")
+    write_text(str(tmp_path / "ignored.txt"), "ignored")
+
+    excluded = []
+    gitignored = []
+    list_files(
+        paths=[tmp_path],
+        exclusion_regexes={re.compile("ignored.txt")},
+        list_files_mode=ListFilesMode.ALL_BUT_GITIGNORED,
+        on_excluded=excluded.append,
+        on_gitignored=gitignored.append,
+    )
+
+    assert excluded == [tmp_path / "ignored.txt"]
+    assert gitignored == []

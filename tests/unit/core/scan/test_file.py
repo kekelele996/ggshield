@@ -6,8 +6,9 @@ import charset_normalizer
 import pytest
 
 from ggshield.core.errors import UnexpectedError
-from ggshield.core.scan import DecodeError, File
+from ggshield.core.scan import DecodeError, File, ScanCoverage, SkipReason
 from ggshield.core.scan.file import create_files_from_paths
+from ggshield.utils.files import ListFilesMode
 from tests.conftest import is_windows
 
 
@@ -248,3 +249,32 @@ def test_create_files_from_paths(
     assert file.content == expected_content
 
     assert len(files) == 1
+
+
+def test_create_files_from_paths_records_coverage(tmp_path):
+    """
+    GIVEN a text file and a file with a binary extension
+    WHEN calling create_files_from_paths() with a coverage tracker
+    THEN the binary file is recorded under SkipReason.BINARY
+    AND the text file is not recorded as skipped
+    """
+    text_path = tmp_path / "normal.txt"
+    text_path.write_text("Normal")
+    binary_path = tmp_path / "image.png"
+    binary_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    coverage = ScanCoverage()
+    files, binary_paths = create_files_from_paths(
+        [tmp_path],
+        exclusion_regexes=set(),
+        list_files_mode=ListFilesMode.ALL,
+        coverage=coverage,
+    )
+
+    assert [f.path for f in files] == [text_path]
+    assert binary_paths == [binary_path]
+    # At this stage only the binary file is classified; text files are
+    # recorded as scanned by the scanner later.
+    assert coverage.skipped_files(SkipReason.BINARY) == [str(binary_path)]
+    assert coverage.scanned_files == []
+    assert coverage.skipped_count == 1

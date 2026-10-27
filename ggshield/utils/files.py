@@ -1,12 +1,13 @@
 from enum import Enum, auto
 from pathlib import Path, PurePath, PurePosixPath
-from typing import List, Pattern, Set, Tuple, Union
+from typing import Callable, List, Pattern, Set, Tuple, Union
 from urllib.parse import quote
 
 from ggshield.utils._binary_extensions import BINARY_EXTENSIONS
 from ggshield.utils.git_shell import (
     get_filepaths_from_ref,
     git_ls,
+    git_ls_ignored,
     git_ls_unstaged,
     is_git_dir,
 )
@@ -86,16 +87,30 @@ def is_path_excluded(
     return any(r.search(path_string) for r in exclusion_regexes)
 
 
+def _noop(path: Path) -> None:
+    pass
+
+
 def list_files(
     paths: List[Path],
     exclusion_regexes: Set[Pattern[str]],
     list_files_mode: ListFilesMode,
+    on_excluded: Callable[[Path], None] = _noop,
+    on_gitignored: Callable[[Path], None] = _noop,
 ) -> Set[Path]:
     """
     Retrieve a set of the files inside `paths`.
 
     Note: only plain files are returned, not directories.
+
+    Files dropped because of a rule are reported through the callbacks:
+    `on_excluded` for exclusion regexes, `on_gitignored` for gitignored files
+    in ALL_BUT_GITIGNORED mode. Each dropped file is reported exactly once.
+    Gitignored files are only enumerated when one of these callbacks is not
+    the default no-op, to avoid an extra git command for callers which do not
+    track them.
     """
+    report_gitignored = on_gitignored is not _noop or on_excluded is not _noop
     targets: Set[Path] = set()
     for path in paths:
         if path.is_file():
@@ -104,11 +119,13 @@ def list_files(
                 and is_git_dir(path.parent)
                 and path.name not in git_ls_unstaged(path.parent) + git_ls(path.parent)
             ):
+                on_gitignored(path)
                 continue
             targets.add(path)
         elif path.is_dir():
             _targets = set()
-            if list_files_mode != ListFilesMode.ALL and is_git_dir(path):
+            in_git_dir = list_files_mode != ListFilesMode.ALL and is_git_dir(path)
+            if in_git_dir:
                 target_filepaths = (
                     get_filepaths_from_ref("HEAD", wd=path)
                     if list_files_mode == ListFilesMode.GIT_COMMITTED
@@ -120,11 +137,27 @@ def list_files(
             else:
                 _targets = path.rglob(r"*")
 
+            if (
+                report_gitignored
+                and list_files_mode == ListFilesMode.ALL_BUT_GITIGNORED
+                and in_git_dir
+            ):
+                # git only listed non-ignored files: enumerate the ignored ones
+                # so they show up in the coverage summary.
+                for relative_path in git_ls_ignored(path):
+                    ignored_path = path / relative_path
+                    if is_path_excluded(ignored_path, exclusion_regexes):
+                        on_excluded(ignored_path)
+                    else:
+                        on_gitignored(ignored_path)
+
             for file_path in _targets:
-                if not file_path.is_dir() and not is_path_excluded(
-                    file_path, exclusion_regexes
-                ):
-                    targets.add(file_path)
+                if file_path.is_dir():
+                    continue
+                if is_path_excluded(file_path, exclusion_regexes):
+                    on_excluded(file_path)
+                    continue
+                targets.add(file_path)
     return targets
 
 

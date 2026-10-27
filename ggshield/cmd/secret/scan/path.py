@@ -13,7 +13,7 @@ from ggshield.cmd.utils.context_obj import ContextObj
 from ggshield.cmd.utils.files import check_directory_not_ignored
 from ggshield.core import ui
 from ggshield.core.client import create_client_from_config
-from ggshield.core.scan import ScanContext, ScanMode, Scannable
+from ggshield.core.scan import ScanContext, ScanCoverage, ScanMode, Scannable
 from ggshield.core.scan.file import create_files_from_paths
 from ggshield.core.scanner_ui import create_scanner_ui
 from ggshield.utils.files import InvalidPathError, ListFilesMode, expand_path_args
@@ -80,12 +80,14 @@ def path_cmd(
                 " Use --recursive to scan directories."
             )
 
+    coverage = ScanCoverage()
     files, binary_paths = create_files_from_paths(
         paths=paths,
         exclusion_regexes=ctx_obj.exclusion_regexes,
         list_files_mode=(
             ListFilesMode.ALL_BUT_GITIGNORED if use_gitignore else ListFilesMode.ALL
         ),
+        coverage=coverage,
     )
     print_file_list(files, binary_paths)
     if not yes:
@@ -108,9 +110,12 @@ def path_cmd(
             scan_context=scan_context,
             secret_config=config.user_config.secret,
         )
-        results = scanner.scan(files, scanner_ui=scanner_ui)
+        results = scanner.scan(files, scanner_ui=scanner_ui, coverage=coverage)
     scan = SecretScanCollection(
-        id=" ".join(str(x) for x in paths), type="path_scan", results=results
+        id=" ".join(str(x) for x in paths),
+        type="path_scan",
+        results=results,
+        coverage=coverage,
     )
 
     return output_handler.process_scan(scan)
