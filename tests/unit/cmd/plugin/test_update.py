@@ -15,6 +15,35 @@ from ggshield.core.plugin.client import (
     PluginSourceType,
 )
 from ggshield.core.plugin.loader import DiscoveredPlugin
+from ggshield.core.plugin.transaction import UpdatedPackage
+
+
+def _configure_transaction_mock(mock_downloader, changed=()):
+    """Wire a mocked downloader's group-update transaction seam.
+
+    The real command code does ``with downloader.update_transaction() as txn``;
+    a bare MagicMock context manager is truthy on ``__exit__``, which would
+    swallow the staged failures under test, so pin ``__exit__`` to False.
+    """
+    txn = mock.MagicMock()
+    txn.__enter__.return_value = txn
+    txn.__exit__.return_value = False
+    mock_downloader.update_transaction.return_value = txn
+    mock_downloader.stage_platform_update.return_value = mock.MagicMock()
+    mock_downloader.stage_github_release_update.return_value = mock.MagicMock()
+    mock_downloader.prepare_trust_update.return_value = None
+    mock_downloader.commit_update.return_value = list(changed)
+    return txn
+
+
+def _changed(name, old, new, wheel_path=None):
+    return UpdatedPackage(
+        name=name,
+        dist_name=name,
+        old_version=old,
+        new_version=new,
+        wheel_path=wheel_path or Path(f"/path/to/{name}"),
+    )
 
 
 class TestPluginUpdate:
@@ -251,6 +280,9 @@ class TestPluginUpdate:
             mock_downloader = mock.MagicMock()
             # Return None for get_plugin_source to treat as legacy GitGuardian plugin
             mock_downloader.get_plugin_source.return_value = None
+            _configure_transaction_mock(
+                mock_downloader, changed=[_changed("tokenscanner", "1.0.0", "2.0.0")]
+            )
             mock_downloader_class.return_value = mock_downloader
 
             result = cli_fs_runner.invoke(
@@ -260,10 +292,13 @@ class TestPluginUpdate:
             )
 
         assert result.exit_code == ExitCode.SUCCESS
-        assert "Updating tokenscanner" in result.output
+        assert "Preparing tokenscanner" in result.output
         assert "1.0.0 -> 2.0.0" in result.output
-        assert "Updated tokenscanner to v2.0.0" in result.output
-        mock_downloader.download_and_install.assert_called_once()
+        # Group summary lists exactly what changed.
+        assert "Updated 1 plugin as a group" in result.output
+        assert "tokenscanner: 1.0.0 -> 2.0.0" in result.output
+        mock_downloader.stage_platform_update.assert_called_once()
+        mock_downloader.commit_update.assert_called_once()
         mock_config.save.assert_called_once()
 
     def test_update_not_installed(self, cli_fs_runner):
@@ -404,6 +439,13 @@ class TestPluginUpdate:
             mock_downloader = mock.MagicMock()
             # Return None for get_plugin_source to treat as legacy GitGuardian plugin
             mock_downloader.get_plugin_source.return_value = None
+            _configure_transaction_mock(
+                mock_downloader,
+                changed=[
+                    _changed("plugin1", "1.0.0", "2.0.0"),
+                    _changed("plugin2", "2.0.0", "3.0.0"),
+                ],
+            )
             mock_downloader_class.return_value = mock_downloader
 
             result = cli_fs_runner.invoke(
@@ -413,10 +455,132 @@ class TestPluginUpdate:
             )
 
         assert result.exit_code == ExitCode.SUCCESS
-        assert "Updating plugin1" in result.output
-        assert "Updating plugin2" in result.output
-        assert "2 plugins updated successfully" in result.output
-        assert mock_downloader.download_and_install.call_count == 2
+        assert "Preparing plugin1" in result.output
+        assert "Preparing plugin2" in result.output
+        # All packages switch as one group and both are listed as changed.
+        assert "Updated 2 plugins as a group" in result.output
+        assert "plugin1: 1.0.0 -> 2.0.0" in result.output
+        assert "plugin2: 2.0.0 -> 3.0.0" in result.output
+        assert mock_downloader.stage_platform_update.call_count == 2
+        mock_downloader.commit_update.assert_called_once()
+
+    def test_update_all_aborts_whole_group_when_second_package_fails(
+        self, cli_fs_runner
+    ):
+        """
+        GIVEN two outdated plugins
+        WHEN package 1 stages fine but package 2 fails signature verification
+        THEN the group is never committed (no partial upgrade) and the output
+             states that no plugins were changed.
+        """
+        from ggshield.core.plugin.signature import (
+            SignatureStatus,
+            SignatureVerificationError,
+        )
+
+        mock_catalog = PluginCatalog(
+            plugins=[
+                PluginInfo(
+                    name="plugin1",
+                    display_name="Plugin 1",
+                    description="",
+                    available=True,
+                    latest_version="2.0.0",
+                    reason=None,
+                ),
+                PluginInfo(
+                    name="plugin2",
+                    display_name="Plugin 2",
+                    description="",
+                    available=True,
+                    latest_version="3.0.0",
+                    reason=None,
+                ),
+            ],
+        )
+        mock_discovered_plugins = [
+            DiscoveredPlugin(
+                name="plugin1",
+                entry_point=None,
+                wheel_path=Path("/p1"),
+                is_installed=True,
+                is_enabled=True,
+                version="1.0.0",
+            ),
+            DiscoveredPlugin(
+                name="plugin2",
+                entry_point=None,
+                wheel_path=Path("/p2"),
+                is_installed=True,
+                is_enabled=True,
+                version="2.0.0",
+            ),
+        ]
+        mock_info = PluginDownloadInfo(
+            filename="x-1.0.0-py3-none-any.whl",
+            sha256="h",
+            version="1",
+            size_bytes=1,
+        )
+        _infos = iter([mock_info, mock_info])
+
+        @contextmanager
+        def fake_download_plugin(*args, **kwargs):
+            yield next(_infos), iter([b""])
+
+        with (
+            mock.patch(
+                "ggshield.cmd.plugin.update.create_client_from_config"
+            ) as mock_create_client,
+            mock.patch(
+                "ggshield.cmd.plugin.update.PluginAPIClient"
+            ) as mock_plugin_api_client_class,
+            mock.patch(
+                "ggshield.cmd.plugin.update.EnterpriseConfig"
+            ) as mock_config_class,
+            mock.patch("ggshield.cmd.plugin.update.PluginLoader") as mock_loader_class,
+            mock.patch(
+                "ggshield.cmd.plugin.update.PluginDownloader"
+            ) as mock_downloader_class,
+        ):
+            mock_create_client.return_value = mock.MagicMock()
+            mock_api = mock.MagicMock()
+            mock_api.get_available_plugins.return_value = mock_catalog
+            mock_api.download_plugin = fake_download_plugin
+            mock_plugin_api_client_class.return_value = mock_api
+
+            mock_config_class.load.return_value = mock.MagicMock()
+            mock_loader = mock.MagicMock()
+            mock_loader.discover_plugins.return_value = mock_discovered_plugins
+            mock_loader_class.return_value = mock_loader
+
+            mock_downloader = mock.MagicMock()
+            mock_downloader.get_plugin_source.return_value = None
+            _configure_transaction_mock(mock_downloader)
+
+            def stage_side_effect(transaction, **kwargs):
+                if kwargs["name"] == "plugin2":
+                    raise SignatureVerificationError(
+                        SignatureStatus.INVALID, "bad signature"
+                    )
+                return mock.MagicMock()
+
+            mock_downloader.stage_platform_update.side_effect = stage_side_effect
+            mock_downloader_class.return_value = mock_downloader
+
+            result = cli_fs_runner.invoke(
+                cli,
+                ["plugin", "update", "--all"],
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == ExitCode.UNEXPECTED_ERROR
+        # Neither the trust document nor the group switch happens.
+        mock_downloader.prepare_trust_update.assert_not_called()
+        mock_downloader.commit_update.assert_not_called()
+        assert "Signature verification failed for plugin2" in result.output
+        assert "all remain at their previous versions" in result.output
+        assert "Updated" not in result.output
 
     def test_update_api_error(self, cli_fs_runner):
         """
@@ -793,15 +957,22 @@ class TestPluginUpdate:
 
             mock_downloader = mock.MagicMock()
             mock_downloader.get_plugin_source.return_value = None
-            mock_downloader.download_and_install.side_effect = DownloadError(
+            _configure_transaction_mock(mock_downloader)
+            mock_downloader.stage_platform_update.side_effect = DownloadError(
                 "Network error"
             )
             mock_downloader_class.return_value = mock_downloader
 
-            result = cli_fs_runner.invoke(cli, ["plugin", "update", "tokenscanner"])
+            result = cli_fs_runner.invoke(
+                cli, ["plugin", "update", "tokenscanner"], catch_exceptions=False
+            )
 
         assert result.exit_code == ExitCode.UNEXPECTED_ERROR
-        assert "Failed to update tokenscanner" in result.output
+        # The whole batch is aborted before any switch, not partially applied.
+        assert "Plugin update aborted while preparing tokenscanner" in result.output
+        assert "Network error" in result.output
+        assert "No plugins were changed" in result.output
+        mock_downloader.commit_update.assert_not_called()
 
     def test_update_plugin_not_available_error(self, cli_fs_runner):
         """
@@ -872,12 +1043,19 @@ class TestPluginUpdate:
 
             mock_downloader = mock.MagicMock()
             mock_downloader.get_plugin_source.return_value = None
+            _configure_transaction_mock(mock_downloader)
             mock_downloader_class.return_value = mock_downloader
 
-            result = cli_fs_runner.invoke(cli, ["plugin", "update", "tokenscanner"])
+            result = cli_fs_runner.invoke(
+                cli,
+                ["plugin", "update", "tokenscanner"],
+                catch_exceptions=False,
+            )
 
         assert result.exit_code == ExitCode.UNEXPECTED_ERROR
-        assert "Failed to update tokenscanner" in result.output
+        assert "Plugin update aborted while preparing tokenscanner" in result.output
+        assert "Upgrade required" in result.output
+        assert "No plugins were changed" in result.output
 
     def test_update_generic_error(self, cli_fs_runner):
         """
@@ -952,15 +1130,22 @@ class TestPluginUpdate:
 
             mock_downloader = mock.MagicMock()
             mock_downloader.get_plugin_source.return_value = None
-            mock_downloader.download_and_install.side_effect = Exception(
+            _configure_transaction_mock(mock_downloader)
+            mock_downloader.stage_platform_update.side_effect = Exception(
                 "Unexpected error"
             )
             mock_downloader_class.return_value = mock_downloader
 
-            result = cli_fs_runner.invoke(cli, ["plugin", "update", "tokenscanner"])
+            result = cli_fs_runner.invoke(
+                cli,
+                ["plugin", "update", "tokenscanner"],
+                catch_exceptions=False,
+            )
 
         assert result.exit_code == ExitCode.UNEXPECTED_ERROR
-        assert "Failed to update tokenscanner" in result.output
+        assert "Plugin update aborted while preparing tokenscanner" in result.output
+        assert "Unexpected error" in result.output
+        assert "No plugins were changed" in result.output
 
     def test_update_non_updatable_plugin(self, cli_fs_runner):
         """
@@ -1506,11 +1691,17 @@ class TestUpdateUsesEntryPointConfigKey:
 
             mock_downloader = mock.MagicMock()
             mock_downloader.get_plugin_source.return_value = None
-            # ``download_and_install`` returns the installed wheel path;
-            # this is what ``resolve_config_key`` reads the entry point
-            # from. Point it at a real wheel on disk with the divergent
-            # entry-point name.
-            mock_downloader.download_and_install.return_value = installed_wheel
+            # ``commit_update`` returns the switched record whose live wheel
+            # ``resolve_config_key`` reads the entry point from. Point it at
+            # a real wheel on disk with the divergent entry-point name.
+            _configure_transaction_mock(
+                mock_downloader,
+                changed=[
+                    _changed(
+                        "machine_scan", "1.0.0", "2.0.0", wheel_path=installed_wheel
+                    )
+                ],
+            )
             mock_downloader_class.return_value = mock_downloader
 
             result = cli_fs_runner.invoke(
@@ -1598,13 +1789,14 @@ class TestUpdateUsesEntryPointConfigKey:
                 url="https://github.com/owner/repo/releases/download/v1.0.0/p.whl",
                 github_repo="owner/repo",
             )
-            # Downloader returns the freshly installed wheel path; the
-            # update flow MUST read its entry-point name (rather than
+            # The switched record carries the freshly committed live wheel;
+            # the update flow MUST read its entry-point name (rather than
             # passing the loader key straight through).
-            mock_downloader.download_from_github_release.return_value = (
-                "ghplugin",
-                "2.0.0",
-                installed_wheel,
+            _configure_transaction_mock(
+                mock_downloader,
+                changed=[
+                    _changed("ghplugin", "1.0.0", "2.0.0", wheel_path=installed_wheel)
+                ],
             )
             mock_downloader_class.return_value = mock_downloader
 
@@ -1738,7 +1930,14 @@ class TestUpdateUsesEntryPointConfigKey:
 
             mock_downloader = mock.MagicMock()
             mock_downloader.get_plugin_source.return_value = None
-            mock_downloader.download_and_install.return_value = installed_wheel
+            _configure_transaction_mock(
+                mock_downloader,
+                changed=[
+                    _changed(
+                        "machine_scan", "1.0.0", "2.0.0", wheel_path=installed_wheel
+                    )
+                ],
+            )
             mock_downloader_class.return_value = mock_downloader
 
             result = cli_fs_runner.invoke(

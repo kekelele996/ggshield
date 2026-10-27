@@ -31,6 +31,7 @@ from ggshield.core.plugin.signature import (
     SignatureVerificationMode,
     verify_wheel_signature,
 )
+from ggshield.core.plugin.transaction import recover_interrupted_transaction
 from ggshield.core.plugin.trust import PluginTrustStore, compute_file_sha256
 
 
@@ -192,6 +193,31 @@ class PluginLoader:
             if signature_mode is not None
             else SignatureVerificationMode.STRICT
         )
+        # Resolve any group update whose process died mid-switch before we
+        # scan the directories: after this, every layer on disk holds either
+        # the complete old group or the complete new one — never a mix that
+        # could make us load a half-swapped (and possibly unsigned) wheel.
+        self._recover_interrupted_updates()
+
+    @staticmethod
+    def _recover_interrupted_updates() -> None:
+        layers = {get_plugins_dir(), get_system_plugins_dir()}
+        for plugins_dir in layers:
+            try:
+                outcome = recover_interrupted_transaction(plugins_dir)
+            except Exception as exc:  # never take the CLI down at startup
+                logger.warning(
+                    "Could not recover interrupted plugin update under %s: %s",
+                    plugins_dir,
+                    exc,
+                )
+                continue
+            if outcome is not None:
+                logger.info(
+                    "Recovered interrupted plugin update under %s: %s",
+                    plugins_dir,
+                    outcome,
+                )
 
     def discover_plugins(self) -> List[DiscoveredPlugin]:
         """Discover all available plugins from entry points and local wheels."""
@@ -543,7 +569,11 @@ class PluginLoader:
             return
 
         for plugin_dir in plugins_dir.iterdir():
-            if not plugin_dir.is_dir():
+            # Dot-directories (e.g. the update transaction's staging area)
+            # are internal state, never loadable plugins. Skipping them also
+            # prevents a half-staged unsigned wheel from being discovered if
+            # a process dies while an update is being prepared.
+            if not plugin_dir.is_dir() or plugin_dir.name.startswith("."):
                 continue
 
             manifest_path = plugin_dir / "manifest.json"

@@ -25,7 +25,10 @@ from ggshield.core.plugin.client import (
 from ggshield.core.plugin.downloader import DownloadError, PluginDownloader
 from ggshield.core.plugin.loader import PluginLoader, enable_installed_plugin
 from ggshield.core.plugin.platform import get_platform_info
-from ggshield.core.plugin.signature import SignatureVerificationMode
+from ggshield.core.plugin.signature import (
+    SignatureVerificationError,
+    SignatureVerificationMode,
+)
 from ggshield.core.text_utils import pluralize
 
 
@@ -317,100 +320,139 @@ def update_cmd(
             ui.display_info(no_updates_msg)
         return
 
-    success_count = 0
-    error_count = 0
+    # Group update: stage (download + checksum + signature-verify + trust
+    # material) every package first, and switch the whole group only once
+    # ALL packages are ready. Any failure aborts before a single live
+    # directory is touched, so a network blip or one bad signature can no
+    # longer leave new and old files mixed together. The switch itself is
+    # journaled: an interrupted commit is rolled back or completed on the
+    # next startup (see core/plugin/transaction.py).
+    staged_packages = []
+    failed_name: Optional[str] = None
+    try:
+        with downloader.update_transaction() as transaction:
+            for update in updates_available:
+                name = update["name"]
+                latest_version = update["latest_version"]
+                source_type = update["source_type"]
+                failed_name = name
 
-    for update in updates_available:
-        name = update["name"]
-        latest_version = update["latest_version"]
-        source_type = update["source_type"]
-
-        ui.display_info(
-            f"Updating {name}: {update['installed_version']} -> {latest_version}..."
-        )
-
-        try:
-            if source_type == PluginSourceType.PLATFORM:
-                assert plugin_api_client is not None
-                platform_info = get_platform_info()
-                with plugin_api_client.download_plugin(
-                    name,
-                    platform_info=platform_info,
-                    version=latest_version,
-                ) as (info, chunks):
-                    bundle_bytes: Optional[bytes] = None
-                    if info.signature_url:
-                        try:
-                            bundle_bytes = plugin_api_client.download_signature_bundle(
-                                info.signature_url
-                            )
-                        except PluginAPIError as bundle_err:
-                            # See install.py: STRICT propagates; WARN
-                            # treats the bundle as unavailable rather
-                            # than aborting an otherwise valid upgrade.
-                            if signature_mode == SignatureVerificationMode.STRICT:
-                                raise
-                            ui.display_warning(
-                                f"Could not fetch signature bundle for {name}: "
-                                f"{bundle_err}. Continuing without verification "
-                                f"(--allow-unsigned)."
-                            )
-                    wheel_path = downloader.download_and_install(
-                        info,
-                        chunks,
-                        name,
-                        signature_mode=signature_mode,
-                        bundle_bytes=bundle_bytes,
-                    )
-
-            elif source_type == PluginSourceType.GITHUB_RELEASE:
-                download_url = update.get("download_url")
-                github_repo = update.get("github_repo")
-                if not download_url or not github_repo:
-                    raise DownloadError(
-                        "Missing GitHub release metadata for plugin update"
-                    )
-
-                _, _, wheel_path = downloader.download_from_github_release(
-                    download_url, signature_mode=signature_mode
+                ui.display_info(
+                    f"Preparing {name}: "
+                    f"{update['installed_version']} -> {latest_version}..."
                 )
 
-            else:
-                raise DownloadError(f"Unsupported plugin source type: {source_type}")
+                if source_type == PluginSourceType.PLATFORM:
+                    assert plugin_api_client is not None
+                    platform_info = get_platform_info()
+                    with plugin_api_client.download_plugin(
+                        name,
+                        platform_info=platform_info,
+                        version=latest_version,
+                    ) as (info, chunks):
+                        bundle_bytes: Optional[bytes] = None
+                        if info.signature_url:
+                            try:
+                                bundle_bytes = (
+                                    plugin_api_client.download_signature_bundle(
+                                        info.signature_url
+                                    )
+                                )
+                            except PluginAPIError as bundle_err:
+                                # See install.py: STRICT propagates; WARN
+                                # treats the bundle as unavailable rather
+                                # than aborting an otherwise valid upgrade.
+                                if signature_mode == SignatureVerificationMode.STRICT:
+                                    raise
+                                ui.display_warning(
+                                    f"Could not fetch signature bundle for {name}: "
+                                    f"{bundle_err}. Continuing without verification "
+                                    f"(--allow-unsigned)."
+                                )
+                        staged = downloader.stage_platform_update(
+                            transaction,
+                            name=name,
+                            old_version=update["installed_version"],
+                            download_info=info,
+                            chunks=chunks,
+                            signature_mode=signature_mode,
+                            bundle_bytes=bundle_bytes,
+                        )
 
-            # Mirror install.py: the loader keys enablement by the
-            # wheel's entry-point name (when present), so update must
-            # use the same key — otherwise the row written below falls
-            # out of sync with discover_plugins and the plugin is
-            # silently disabled after the upgrade. ``name`` here is
-            # already the loader's canonical key, but a stale alias
-            # under the wheel's distribution name from a pre-fix
-            # install may still be on disk; ``enable_installed_plugin``
-            # cleans that up and carries any ``auto_update: false``
-            # forward to the canonical row.
-            enable_installed_plugin(enterprise_config, name, latest_version, wheel_path)
+                elif source_type == PluginSourceType.GITHUB_RELEASE:
+                    download_url = update.get("download_url")
+                    github_repo = update.get("github_repo")
+                    if not download_url or not github_repo:
+                        raise DownloadError(
+                            "Missing GitHub release metadata for plugin update"
+                        )
 
-            ui.display_info(f"  Updated {name} to v{latest_version}")
-            success_count += 1
+                    staged = downloader.stage_github_release_update(
+                        transaction,
+                        name=name,
+                        old_version=update["installed_version"],
+                        url=download_url,
+                        signature_mode=signature_mode,
+                    )
 
-        except Exception as e:
-            ui.display_error(f"  Failed to update {name}: {e}")
-            error_count += 1
+                else:
+                    raise DownloadError(
+                        f"Unsupported plugin source type: {source_type}"
+                    )
 
+                staged_packages.append(staged)
+
+            # All wheels and bundles are verified: prepare the matching
+            # trust document before anything live is switched.
+            failed_name = None
+            downloader.prepare_trust_update(transaction, staged_packages)
+            changed_packages = downloader.commit_update(transaction)
+
+    except SignatureVerificationError as e:
+        ui.display_error(f"  Signature verification failed for {failed_name}: {e}")
+        ui.display_info(
+            "Update aborted — no plugins were changed; all remain at their "
+            "previous versions."
+        )
+        ui.display_info(
+            "If you trust the origin of every plugin in this update, re-run "
+            "with --allow-unsigned."
+        )
+        ctx.exit(ExitCode.UNEXPECTED_ERROR)
+    except Exception as e:
+        target = f" while preparing {failed_name}" if failed_name else ""
+        ui.display_error(f"  Plugin update aborted{target}: {e}")
+        ui.display_info(
+            "No plugins were changed; all remain at their previous versions."
+        )
+        ctx.exit(ExitCode.UNEXPECTED_ERROR)
+
+    # The group is switched; mirror install.py for enablement. The loader
+    # keys enablement by the wheel's entry-point name (when present), so this
+    # must use the same key — ``enable_installed_plugin`` resolves it from the
+    # freshly committed wheel, migrates stale aliases, and carries any
+    # ``auto_update: false`` choice forward to the canonical row.
+    for package in changed_packages:
+        enable_installed_plugin(
+            enterprise_config,
+            package.name,
+            package.new_version,
+            package.wheel_path,
+        )
     enterprise_config.save()
 
-    # Summary
-    if success_count > 0:
-        ui.display_info("")
-        ui.display_info(
-            f"{success_count} {pluralize('plugin', success_count)} updated successfully."
-        )
+    # Summary: list exactly which packages the group update changed.
+    ui.display_info("")
+    ui.display_heading(
+        f"Updated {len(changed_packages)} "
+        f"{pluralize('plugin', len(changed_packages))} as a group"
+    )
+    for package in changed_packages:
+        old_version = package.old_version or "?"
+        ui.display_info(f"  {package.name}: {old_version} -> {package.new_version}")
 
     if update_all:
         _display_non_updatable_footer(non_updatable_plugins)
-
-    if error_count > 0:
-        ctx.exit(ExitCode.UNEXPECTED_ERROR)
 
 
 def _display_non_updatable_footer(

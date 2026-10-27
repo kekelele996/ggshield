@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -35,6 +36,11 @@ from ggshield.core.plugin.signature import (
     SignatureStatus,
     SignatureVerificationMode,
     verify_wheel_signature,
+)
+from ggshield.core.plugin.transaction import (
+    PluginUpdateTransaction,
+    UpdatedPackage,
+    recover_interrupted_transaction,
 )
 from ggshield.core.plugin.trust import PluginTrustStore, compute_file_sha256
 from ggshield.core.plugin.wheel_utils import (
@@ -248,6 +254,19 @@ class GitHubArtifactError(DownloadError):
     pass
 
 
+@dataclass
+class StagedUpdate:
+    """One package staged inside a :class:`PluginUpdateTransaction`.
+
+    ``package`` is the journal package record (see
+    :mod:`ggshield.core.plugin.transaction`); ``signature_info`` carries the
+    verification result used to build the staged trust document.
+    """
+
+    package: Dict[str, Any]
+    signature_info: "SignatureInfo"
+
+
 class PluginDownloader:
     """Downloads and installs plugin wheels."""
 
@@ -272,6 +291,23 @@ class PluginDownloader:
         for read_dir in (self.plugins_dir, get_plugins_dir(), get_system_plugins_dir()):
             if read_dir not in self._read_dirs:
                 self._read_dirs.append(read_dir)
+
+        # Finish or undo an update whose process died mid-switch before we
+        # touch anything in this layer. The journal guarantees the on-disk
+        # group converges to either the complete old or the complete new set.
+        try:
+            recover_interrupted_transaction(
+                self.plugins_dir,
+                self.trust_store.path,
+                publish_dir=self._publish_machine_wide_install,
+                package_finished=self._post_commit_package_cleanup,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Could not recover interrupted plugin update under %s: %s",
+                self.plugins_dir,
+                exc,
+            )
 
     def _publish_machine_wide_install(self, plugin_dir: Path) -> None:
         """Make a root (machine-wide) install loadable by every user.
@@ -975,7 +1011,9 @@ class PluginDownloader:
             return None
 
         for plugin_dir in base.iterdir():
-            if not plugin_dir.is_dir():
+            # Dot-directories hold update transaction state (staging/backup),
+            # never loadable plugins.
+            if not plugin_dir.is_dir() or plugin_dir.name.startswith("."):
                 continue
 
             manifest_path = plugin_dir / "manifest.json"
@@ -1104,17 +1142,16 @@ class PluginDownloader:
         if not self._is_valid_plugin_name(plugin_name):
             raise DownloadError(f"Invalid plugin name: {plugin_name!r}")
 
-    def _write_manifest(
+    def _build_manifest(
         self,
-        plugin_dir: Path,
         plugin_name: str,
         version: str,
         wheel_filename: str,
         sha256: str,
         source: PluginSource,
         signature_info: Optional[SignatureInfo] = None,
-    ) -> None:
-        """Write the plugin manifest file."""
+    ) -> Dict[str, Any]:
+        """Build the plugin manifest mapping written for every install path."""
         manifest: Dict[str, Any] = {
             "plugin_name": plugin_name,
             "version": version,
@@ -1130,6 +1167,27 @@ class PluginDownloader:
             if signature_info.message:
                 sig_data["message"] = signature_info.message
             manifest["signature"] = sig_data
+        return manifest
+
+    def _write_manifest(
+        self,
+        plugin_dir: Path,
+        plugin_name: str,
+        version: str,
+        wheel_filename: str,
+        sha256: str,
+        source: PluginSource,
+        signature_info: Optional[SignatureInfo] = None,
+    ) -> None:
+        """Write the plugin manifest file."""
+        manifest = self._build_manifest(
+            plugin_name=plugin_name,
+            version=version,
+            wheel_filename=wheel_filename,
+            sha256=sha256,
+            source=source,
+            signature_info=signature_info,
+        )
 
         manifest_path = plugin_dir / "manifest.json"
         tmp_path = manifest_path.with_suffix(".json.tmp")
@@ -1166,6 +1224,215 @@ class PluginDownloader:
             plugin_name,
             sha256,
             signature_info.status.value,
+        )
+
+    # ------------------------------------------------------------------
+    # Transactional group updates
+    #
+    # ``plugin update`` may switch several packages at once. These staging
+    # helpers download, checksum and signature-verify every wheel into the
+    # transaction's hidden staging area (never the live plugin dirs); the
+    # group is switched only once ALL packages are ready — see
+    # :mod:`ggshield.core.plugin.transaction` for the crash-recovery journal.
+    # ------------------------------------------------------------------
+
+    def update_transaction(self) -> PluginUpdateTransaction:
+        """Open a prepare-then-commit transaction on this downloader's layer."""
+        return PluginUpdateTransaction(self.plugins_dir, self.trust_store.path)
+
+    def stage_platform_update(
+        self,
+        transaction: PluginUpdateTransaction,
+        *,
+        name: str,
+        old_version: Optional[str],
+        download_info: PluginDownloadInfo,
+        chunks: Iterator[bytes],
+        signature_mode: SignatureVerificationMode = SignatureVerificationMode.STRICT,
+        bundle_bytes: Optional[bytes] = None,
+    ) -> "StagedUpdate":
+        """Download and verify one platform package into ``transaction``.
+
+        Mirrors :meth:`download_and_install`'s stream handling, but writes
+        into the staging directory: a checksum mismatch, a missing/invalid
+        signature in STRICT mode, or a bad wheel aborts the whole group while
+        the live install stays untouched.
+        """
+        self._validate_plugin_name(name)
+        dist_name = _wheel_distribution_name(download_info.filename)
+        self._validate_plugin_name(dist_name)
+
+        staged_dir = transaction.stage_package_dir(dist_name)
+        staged_wheel = staged_dir / download_info.filename
+
+        logger.info("Preparing %s...", download_info.filename)
+        sha256_hash = hashlib.sha256()
+        with open(staged_wheel, "wb") as f:
+            for chunk in chunks:
+                f.write(chunk)
+                sha256_hash.update(chunk)
+
+        computed_hash = sha256_hash.hexdigest()
+        if computed_hash.lower() != download_info.sha256.lower():
+            raise ChecksumMismatchError(download_info.sha256, computed_hash)
+
+        if bundle_bytes is not None:
+            (staged_dir / (download_info.filename + ".sigstore")).write_bytes(
+                bundle_bytes
+            )
+
+        # Verify the staged wheel before it can ever reach a live
+        # directory — STRICT failure aborts the entire batch here. The
+        # transaction's context manager discards the whole staging area.
+        sig_info = verify_wheel_signature(staged_wheel, signature_mode)
+
+        source = PluginSource(type=PluginSourceType.PLATFORM)
+        self._write_manifest(
+            plugin_dir=staged_dir,
+            plugin_name=dist_name,
+            version=download_info.version,
+            wheel_filename=download_info.filename,
+            sha256=download_info.sha256,
+            source=source,
+            signature_info=sig_info,
+        )
+
+        package = transaction.add_package(
+            name=name,
+            dist_name=dist_name,
+            old_version=old_version,
+            new_version=download_info.version,
+            wheel_filename=download_info.filename,
+            sha256=download_info.sha256,
+            live_path=self._resolve_plugin_dir(name),
+        )
+        return StagedUpdate(package=package, signature_info=sig_info)
+
+    def stage_github_release_update(
+        self,
+        transaction: PluginUpdateTransaction,
+        *,
+        name: str,
+        old_version: Optional[str],
+        url: str,
+        signature_mode: SignatureVerificationMode = SignatureVerificationMode.STRICT,
+    ) -> "StagedUpdate":
+        """Download and verify one GitHub-release wheel into ``transaction``."""
+        if url.startswith("http://"):
+            raise InsecureSourceError(
+                "HTTP URLs are not allowed for security reasons. Use HTTPS instead."
+            )
+        if not url.startswith("https://"):
+            raise DownloadError(f"Invalid URL scheme: {url}")
+
+        github_repo = self._extract_github_repo(url)
+        raw_filename = url.split("/")[-1].split("?")[0]
+        try:
+            filename = sanitize_wheel_filename(raw_filename)
+        except InvalidWheelError as e:
+            raise DownloadError(f"Invalid wheel asset in release: {e}") from e
+
+        dist_name = _wheel_distribution_name(filename)
+        self._validate_plugin_name(dist_name)
+
+        staged_dir = transaction.stage_package_dir(dist_name)
+        staged_wheel = staged_dir / filename
+
+        logger.info("Preparing %s from GitHub release...", filename)
+        try:
+            response = requests.get(url, stream=True, timeout=HTTP_TIMEOUT_SECONDS)
+            assert_all_https(response, exc_factory=InsecureSourceError)
+            response.raise_for_status()
+            computed_hash = _stream_to_file(
+                response, staged_wheel, MAX_WHEEL_SIZE_BYTES, hash_bytes=True
+            )
+            assert computed_hash is not None
+        except requests.RequestException as e:
+            raise DownloadError(f"Failed to download from GitHub release: {e}") from e
+
+        try:
+            metadata = extract_wheel_metadata(staged_wheel)
+        except WheelError as e:
+            raise DownloadError(f"Downloaded file is not a valid wheel: {e}") from e
+
+        # Fetch the sigstore bundle into staging before verification.
+        self._download_url_bundle(url, staged_wheel)
+        sig_info = verify_wheel_signature(staged_wheel, signature_mode)
+
+        source = PluginSource(
+            type=PluginSourceType.GITHUB_RELEASE,
+            url=_redact_url_credentials(url),
+            github_repo=github_repo,
+            sha256=computed_hash,
+        )
+        self._write_manifest(
+            plugin_dir=staged_dir,
+            plugin_name=dist_name,
+            version=metadata.version,
+            wheel_filename=filename,
+            sha256=computed_hash,
+            source=source,
+            signature_info=sig_info,
+        )
+
+        package = transaction.add_package(
+            name=name,
+            dist_name=dist_name,
+            old_version=old_version,
+            new_version=metadata.version,
+            wheel_filename=filename,
+            sha256=computed_hash,
+            live_path=self._resolve_plugin_dir(name),
+        )
+        return StagedUpdate(package=package, signature_info=sig_info)
+
+    def prepare_trust_update(
+        self,
+        transaction: PluginUpdateTransaction,
+        staged: List["StagedUpdate"],
+    ) -> None:
+        """Render the complete post-update trust document into staging.
+
+        Starts from the current trust document and applies every package's
+        install-time decision (VALID clears a stale exception; anything else
+        records the exact wheel hash), so the trust material switches as one
+        file in :meth:`commit_update` together with the wheels.
+        """
+        data = self.trust_store.load_data()
+        for staged_update in staged:
+            self.trust_store.apply_install(
+                data,
+                staged_update.package["dist_name"],
+                staged_update.package["sha256"],
+                staged_update.signature_info.status.value,
+            )
+        transaction.stage_trust(data)
+
+    def commit_update(
+        self, transaction: PluginUpdateTransaction
+    ) -> List[UpdatedPackage]:
+        """Switch the whole prepared group at once.
+
+        Returns the switched packages (live wheel paths included); raises and
+        leaves the complete old group in place if the switch cannot finish.
+        """
+        return transaction.commit(
+            publish_dir=self._publish_machine_wide_install,
+            package_finished=self._post_commit_package_cleanup,
+        )
+
+    def _post_commit_package_cleanup(self, package: Dict[str, Any]) -> None:
+        """Run per-package post-commit hooks from the journal finish step.
+
+        Migrates a legacy catalog-named install dir, exactly as the single
+        install path did inline before group updates existed.
+        """
+        live_path = package.get("live_path")
+        if not live_path:
+            return
+        self._cleanup_legacy_install_dir(
+            catalog_reference=package["name"],
+            current_dir=Path(live_path),
         )
 
     def _download_url_bundle(

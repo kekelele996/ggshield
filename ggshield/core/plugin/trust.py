@@ -105,6 +105,39 @@ class PluginTrustStore:
         record = self.get_record(plugin_name)
         return bool(record and record.sha256.lower() == sha256.lower())
 
+    def load_data(self) -> Dict[str, Any]:
+        """Return the full trust document (``version`` + ``plugins`` map).
+
+        Used to build a whole-document replacement that is staged together
+        with a group update (see :mod:`ggshield.core.plugin.transaction`), so
+        the trust material switches atomically with the wheels it certifies.
+        """
+        return self._load_data()
+
+    def apply_install(
+        self,
+        data: Dict[str, Any],
+        plugin_name: str,
+        sha256: str,
+        signature_status: str,
+    ) -> Dict[str, Any]:
+        """Return ``data`` with one install's trust decision applied.
+
+        Mirrors :meth:`trust_plugin`/:meth:`revoke_plugin` semantics on an
+        in-memory document: a VALID signature clears any stale trust
+        exception, anything else records the exact wheel hash.
+        """
+        plugins = data.setdefault("plugins", {})
+        if signature_status == "valid":
+            plugins.pop(plugin_name, None)
+        else:
+            plugins[plugin_name] = {
+                "sha256": sha256,
+                "signature_status": signature_status,
+                "trusted_at": datetime.now(timezone.utc).isoformat(),
+            }
+        return data
+
     def _default_data(self) -> Dict[str, Any]:
         return {
             "version": TRUST_STORE_VERSION,
