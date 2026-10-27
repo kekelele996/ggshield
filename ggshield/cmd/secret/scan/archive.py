@@ -16,10 +16,15 @@ from ggshield.core.errors import UnexpectedError
 from ggshield.core.scan import ScanContext, ScanMode
 from ggshield.core.scan.file import create_files_from_paths
 from ggshield.core.scanner_ui import create_scanner_ui
-from ggshield.utils.archive import safe_unpack
+from ggshield.utils.archive import (
+    ArchiveLimitsExceeded,
+    UnsafeArchive,
+    safe_unpack,
+)
 from ggshield.utils.click import RealPath
 from ggshield.utils.files import ListFilesMode
 from ggshield.verticals.secret import SecretScanCollection, SecretScanner
+from ggshield.verticals.secret.secret_scan_collection import make_file_error
 
 
 @click.command()
@@ -36,11 +41,18 @@ def archive_cmd(
     """
     Scan an archive file. Supported archive formats are zip, whl, jar, tar, tar.gz, tar.bz2 and tar.xz.
     """
+    # The temporary directory is removed whether the scan succeeds or fails (or
+    # is refused because the archive is too big), so unpacked content never
+    # lingers on the temporary disk.
     with tempfile.TemporaryDirectory(suffix="ggshield") as temp_dir:
         temp_path = Path(temp_dir)
         ui.display_heading("Unpacking archive")
         try:
-            safe_unpack(path, extract_dir=temp_path)
+            unpack_report = safe_unpack(path, extract_dir=temp_path)
+        except ArchiveLimitsExceeded as exn:
+            raise UnexpectedError(f'Refused to unpack "{path}" archive:\n{exn}')
+        except UnsafeArchive as exn:
+            raise UnexpectedError(f'Failed to unpack "{path}" archive: {exn}')
         except Exception as exn:
             raise UnexpectedError(f'Failed to unpack "{path}" archive: {exn}')
 
@@ -68,6 +80,18 @@ def archive_cmd(
                 secret_config=config.user_config.secret,
             )
             results = scanner.scan(files, scanner_ui=scanner_ui)
+
+        # Members whose data could not be read are skipped during unpacking,
+        # but they must make the scan report as incomplete: a clean result on
+        # the remaining files does not mean the archive contained no secret.
+        for member_name, reason in unpack_report.unread_members:
+            results.errors.append(
+                make_file_error(
+                    member_name,
+                    f"could not be extracted from the archive: {reason}",
+                )
+            )
+            results.incomplete = True
 
         scan = SecretScanCollection(id=path, type="archive_scan", results=results)
 

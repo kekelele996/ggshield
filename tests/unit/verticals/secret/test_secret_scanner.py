@@ -2,7 +2,7 @@ import json
 import platform
 from collections import namedtuple
 from typing import Any, Dict, List
-from unittest.mock import ANY, Mock, patch
+from unittest.mock import ANY, Mock, PropertyMock, patch
 
 import click
 import pytest
@@ -175,9 +175,74 @@ def test_scanner_skips_unscannable_files(client, fs, cache, unscannable_type: st
         check_api_key=False,
         secret_config=SecretConfig(),
     )
-    scanner.scan([mock], scanner_ui=scanner_ui)
+    results = scanner.scan([mock], scanner_ui=scanner_ui)
 
     scanner_ui.on_skipped.assert_called_once()
+    # A file skipped for a "normal" reason does not make the scan incomplete
+    assert results.incomplete is False
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    [
+        pytest.param("size_check", id="oserror-on-size-check"),
+        pytest.param("content_read", id="unexpected-error-on-content-read"),
+    ],
+)
+@patch("pygitguardian.GGClient.multi_content_scan")
+def test_scanner_unreadable_file_is_skipped_and_scan_incomplete(
+    scan_mock: Mock, client, cache, failure_point: str
+):
+    """
+    GIVEN one file which cannot be read and one valid file
+    WHEN Scanner.scan() is called
+    THEN the unreadable file is skipped and the other file is still scanned
+    AND the returned Results are marked incomplete and describe the unread file
+    """
+    bad = Mock(spec=Scannable)
+    bad.filename = "bad.txt"
+    bad.filemode = Filemode.FILE
+    if failure_point == "size_check":
+        bad.is_longer_than.side_effect = OSError("permission denied")
+    else:
+        bad.is_longer_than.return_value = False
+        type(bad).content = PropertyMock(
+            side_effect=UnexpectedError("Failed to read bad.txt: permission denied")
+        )
+
+    good = StringScannable(url="good.txt", content="nothing secret here")
+
+    scan_result = ScanResult(policy_break_count=0, policy_breaks=[], policies=[])
+    multi_scan_result = MultiScanResult([scan_result])
+    multi_scan_result.status_code = 200
+    scan_mock.return_value = multi_scan_result
+
+    scanner_ui = Mock(spec=ScannerUI)
+    scanner = SecretScanner(
+        client=client,
+        cache=cache,
+        scan_context=ScanContext(
+            scan_mode=ScanMode.ARCHIVE,
+            command_path="external",
+        ),
+        check_api_key=False,
+        secret_config=SecretConfig(),
+    )
+    results = scanner.scan([bad, good], scanner_ui=scanner_ui)
+
+    # Only the readable file was sent to the API
+    documents = scan_mock.call_args[0][0]
+    assert documents == [{"document": "nothing secret here", "filename": "good.txt"}]
+
+    skip_reason = scanner_ui.on_skipped.call_args[0][1]
+    assert "can't read file" in skip_reason
+
+    assert results.incomplete is True
+    assert len(results.errors) == 1
+    assert results.errors[0].files == [("bad.txt", Filemode.FILE)]
+    assert "could not be read" in results.errors[0].description
+    assert len(results.results) == 1
+    assert results.results[0].filename == "good.txt"
 
 
 def test_handle_scan_error_api_key():

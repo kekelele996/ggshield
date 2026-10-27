@@ -27,6 +27,7 @@ from ggshield.verticals.secret.output import (
     SecretOutputHandler,
 )
 from ggshield.verticals.secret.secret_scan_collection import (
+    Error,
     IgnoreKind,
     IgnoreReason,
     group_secrets_by_ignore_sha,
@@ -776,3 +777,56 @@ def test_vault_path_in_json_output(
         assert "vault_name" not in incident
         assert "vault_path" not in incident
         assert "vault_path_count" not in incident
+
+
+def test_json_output_marks_incomplete_scan():
+    """
+    GIVEN a scan which could not scan all its input files
+    WHEN generating json output
+    THEN the top-level payload carries "incomplete": true and lists the errors
+    """
+    output_handler = SecretJSONOutputHandler(
+        secret_config=SecretConfig(), verbose=False
+    )
+    results = Results(
+        results=[],
+        errors=[
+            Error(
+                files=[("bad.txt", Filemode.FILE)],
+                description="could not be read: permission denied",
+            )
+        ],
+        incomplete=True,
+    )
+    output = output_handler._process_scan_impl(
+        SecretScanCollection(id="archive.zip", type="archive_scan", results=results)
+    )
+
+    payload = json.loads(output)
+    assert payload["incomplete"] is True
+    assert payload["errors"] == [
+        {
+            "files": [{"filename": "bad.txt", "mode": "FILE"}],
+            "description": "could not be read: permission denied",
+        }
+    ]
+
+
+def test_json_output_marks_complete_scan():
+    """
+    GIVEN a fully successful scan
+    WHEN generating json output
+    THEN the top-level payload carries "incomplete": false and no errors key
+    """
+    output_handler = SecretJSONOutputHandler(
+        secret_config=SecretConfig(), verbose=False
+    )
+    output = output_handler._process_scan_impl(
+        SecretScanCollection(
+            id="archive.zip", type="archive_scan", results=Results(results=[], errors=[])
+        )
+    )
+
+    payload = json.loads(output)
+    assert payload["incomplete"] is False
+    assert "errors" not in payload

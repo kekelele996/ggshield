@@ -58,4 +58,8 @@ class SecretOutputHandler(ABC):
     def _get_exit_code(self, scan: SecretScanCollection) -> ExitCode:
         if scan.total_secrets_count > 0:
             return ExitCode.SCAN_FOUND_PROBLEMS
+        if scan.is_incomplete:
+            # The scan ran, but part of the input could not be scanned: this must
+            # not be confused with a successful scan that found no secret.
+            return ExitCode.SCAN_INCOMPLETE
         return ExitCode.SUCCESS

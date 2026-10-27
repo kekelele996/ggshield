@@ -26,6 +26,31 @@ from ..secret_scan_collection import (
 from .secret_output_handler import SecretOutputHandler
 
 
+def incomplete_scan_warning() -> str:
+    """
+    Build the header of the warning shown when a scan could not scan all its
+    input files.
+    """
+    return format_text(
+        "\nWarning: the scan is incomplete, the following files could not be "
+        "scanned:\n",
+        STYLE["warning"],
+    )
+
+
+def incomplete_no_leak_message() -> str:
+    """
+    Build the message shown when no secret is found but the scan is incomplete.
+    Must not be confused with no_leak_message(), which is shown only when the
+    whole input was scanned.
+    """
+    return format_text(
+        "\nNo secrets have been found in the files that were successfully "
+        "scanned, but some files could not be scanned.\n",
+        STYLE["warning"],
+    )
+
+
 # MAX_SECRET_SIZE controls the max length of |-----| under a secret
 # avoids occupying a lot of space in a CI terminal.
 MAX_SECRET_SIZE = 80
@@ -67,13 +92,17 @@ class SecretTextOutputHandler(SecretOutputHandler):
         if self.verbose:
             scan_buf.write(secrets_engine_version())
         scan_buf.write(processed_scan_results)
+        if scan.is_incomplete:
+            scan_buf.write(self.process_incomplete_errors(scan))
         if not processed_scan_results:
-
-            scan_buf.write(
-                no_new_leak_message()
-                if self.ignore_known_secrets
-                else no_leak_message()
-            )
+            if scan.is_incomplete:
+                scan_buf.write(incomplete_no_leak_message())
+            else:
+                scan_buf.write(
+                    no_new_leak_message()
+                    if self.ignore_known_secrets
+                    else no_leak_message()
+                )
 
         known_secrets_count = sum(
             result.ignored_secrets_count_by_kind.get(IgnoreKind.KNOWN_SECRET, 0)
@@ -109,6 +138,28 @@ class SecretTextOutputHandler(SecretOutputHandler):
                 results_buf.write(inner_scan_str)
 
         return results_buf.getvalue()
+
+    def process_incomplete_errors(self, scan: SecretScanCollection) -> str:
+        """
+        List the files which could not be scanned, so the user can tell an
+        incomplete scan apart from a scan which found no secret.
+        """
+        errors_buf = StringIO()
+        errors_buf.write(incomplete_scan_warning())
+        for error in scan.get_all_errors():
+            if error.files:
+                for filename, _filemode in error.files:
+                    errors_buf.write(
+                        format_text(
+                            f"- {filename}: {error.description}\n",
+                            STYLE["warning"],
+                        )
+                    )
+            else:
+                errors_buf.write(
+                    format_text(f"- {error.description}\n", STYLE["warning"])
+                )
+        return errors_buf.getvalue()
 
     def process_result(self, result: Result) -> str:
         """

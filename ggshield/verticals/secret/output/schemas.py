@@ -58,3 +58,6 @@ class JSONScanCollectionSchema(BaseSchema):
     total_incidents = fields.Integer(required=True)
     total_occurrences = fields.Integer(required=True)
     secrets_engine_version = fields.String(required=False)
+    # Present on the top-level scan only: lets API consumers tell a clean scan
+    # apart from one in which some files could not be scanned.
+    incomplete = fields.Boolean(required=False)

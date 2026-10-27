@@ -5,6 +5,7 @@ import click
 import pytest
 
 from ggshield.core.config.user_config import SecretConfig
+from ggshield.core.errors import ExitCode
 from ggshield.core.scan import StringScannable
 from ggshield.utils.git_shell import Filemode
 from ggshield.verticals.secret import Result, Results, SecretScanCollection
@@ -13,6 +14,7 @@ from ggshield.verticals.secret.output.secret_text_output_handler import (
     format_line_count_break,
 )
 from ggshield.verticals.secret.secret_scan_collection import (
+    Error,
     IgnoreKind,
     IgnoreReason,
     group_secrets_by_ignore_sha,
@@ -380,3 +382,90 @@ def test_vault_path_in_text_output(
         assert "├─ Vault Type:" not in output
         assert "├─ Vault Name:" not in output
         assert "└─ Secret Path:" not in output
+
+
+def _incomplete_results(results=None) -> Results:
+    return Results(
+        results=results or [],
+        errors=[
+            Error(
+                files=[("broken/bad.txt", Filemode.FILE)],
+                description="could not be extracted from the archive: Bad CRC-32",
+            )
+        ],
+        incomplete=True,
+    )
+
+
+def test_text_output_incomplete_scan_without_secret_is_distinct():
+    """
+    GIVEN an incomplete scan without secret
+    WHEN generating text output
+    THEN it says so and does not print the plain "No secrets have been found"
+         message, and the exit code distinguishes it from a complete clean scan
+    """
+    secret_config = SecretConfig()
+    output_handler = SecretTextOutputHandler(
+        secret_config=secret_config, verbose=False
+    )
+    scan = SecretScanCollection(
+        id="archive.zip", type="archive_scan", results=_incomplete_results()
+    )
+
+    output = click.unstyle(output_handler._process_scan_impl(scan))
+
+    assert "the scan is incomplete" in output
+    assert "broken/bad.txt" in output
+    assert "could not be extracted" in output
+    assert "some files could not be scanned" in output
+    assert "No secrets have been found\n" not in output
+    assert output_handler._get_exit_code(scan) == ExitCode.SCAN_INCOMPLETE
+
+
+def test_text_output_incomplete_scan_with_secret_reports_problems():
+    """
+    GIVEN an incomplete scan in which a secret was found
+    WHEN computing the exit code
+    THEN finding problems takes precedence over incompleteness
+    """
+    secret_config = SecretConfig()
+    scannable = ScannableFactory()
+    policy_break = PolicyBreakFactory(content=scannable.content)
+    result = Result.from_scan_result(
+        scannable, ScanResultFactory(policy_breaks=[policy_break]), secret_config
+    )
+    output_handler = SecretTextOutputHandler(
+        secret_config=secret_config, verbose=False
+    )
+    scan = SecretScanCollection(
+        id="archive.zip",
+        type="archive_scan",
+        results=_incomplete_results(results=[result]),
+    )
+
+    output = click.unstyle(output_handler._process_scan_impl(scan))
+
+    assert "the scan is incomplete" in output
+    assert "Secret detected" in output
+    assert output_handler._get_exit_code(scan) == ExitCode.SCAN_FOUND_PROBLEMS
+
+
+def test_text_output_complete_clean_scan_is_successful():
+    """
+    GIVEN a complete scan without secret
+    WHEN processing it
+    THEN it prints the plain no-secret message and exits 0
+    """
+    secret_config = SecretConfig()
+    output_handler = SecretTextOutputHandler(
+        secret_config=secret_config, verbose=False
+    )
+    scan = SecretScanCollection(
+        id="archive.zip", type="archive_scan", results=Results()
+    )
+
+    output = click.unstyle(output_handler._process_scan_impl(scan))
+
+    assert "No secrets have been found" in output
+    assert "incomplete" not in output
+    assert output_handler._get_exit_code(scan) == ExitCode.SUCCESS

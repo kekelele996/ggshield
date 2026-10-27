@@ -35,6 +35,9 @@ class SecretJSONOutputHandler(SecretOutputHandler):
 
         if top:
             scan_dict["secrets_engine_version"] = VERSIONS.secrets_engine_version
+            # Lets API consumers tell a clean scan apart from one in which some
+            # files could not be scanned.
+            scan_dict["incomplete"] = scan.is_incomplete
 
         if scan.results:
             for result in scan.results.results:

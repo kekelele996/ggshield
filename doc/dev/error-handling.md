@@ -12,6 +12,8 @@ It is important for users (and for our tests) to be able to make the distinction
 - 1: Scan was successful but it found problems (e.g. leaked secrets)
 - 2: Error on the command-line, like a missing parameter
 - 3: An authentication subcommand failed
+- 4: GitGuardian server is not responding
+- 5: Scan completed but some files could not be scanned, so the result is incomplete
 - 128: Something else
 
 Refer to the `ExitCode` enum in [core.errors][errors] for an up-to-date list.

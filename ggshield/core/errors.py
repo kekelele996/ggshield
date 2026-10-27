@@ -36,6 +36,9 @@ class ExitCode(IntEnum):
     AUTHENTICATION_ERROR = 3
     # GitGuardian server is not responding
     GITGUARDIAN_SERVER_UNAVAILABLE = 4
+    # Scan completed, but some files could not be scanned, so the result may be
+    # incomplete. Distinct from SUCCESS, which means the whole input was scanned.
+    SCAN_INCOMPLETE = 5
 
     # Add new exit codes here.
     # If you add a new exit code, make sure you also add it to the documentation.

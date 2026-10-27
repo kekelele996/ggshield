@@ -6,7 +6,7 @@ import logging
 import os
 from ast import literal_eval
 from concurrent.futures import Future
-from typing import Dict, Iterable, List, Optional, Union
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import requests
 from pygitguardian import GGClient
@@ -27,7 +27,7 @@ from ggshield.core.scan.scannable import NonSeekableFileError
 from ggshield.core.scanner_ui.scanner_ui import ScannerUI
 from ggshield.core.text_utils import pluralize
 
-from .secret_scan_collection import Result, Results
+from .secret_scan_collection import Error, Result, Results
 
 
 # GitGuardian API does not accept paths longer than this
@@ -66,6 +66,10 @@ class SecretScanner:
         self.headers.update({"scan_options": secret_config.dump_for_monitoring()})
 
         self.command_id = scan_context.command_id
+
+        # (scannable, reason) pairs for files whose content could not be read at
+        # all. They make the scan incomplete but do not abort it.
+        self.unreadable_files: List[Tuple[Scannable, str]] = []
 
     def scan(
         self,
@@ -187,6 +191,13 @@ class SecretScanner:
             except FileNotFoundError:
                 scanner_ui.on_skipped(scannable, "file not found")
                 continue
+            except (OSError, UnexpectedError) as exc:
+                # One unreadable file must not abort the scan of the other files:
+                # report it and keep going. It makes the resulting scan incomplete.
+                reason = f"can't read file: {exc}"
+                scanner_ui.on_skipped(scannable, reason)
+                self.unreadable_files.append((scannable, str(exc)))
+                continue
 
             if not content:
                 scanner_ui.on_skipped(scannable, "")
@@ -266,7 +277,24 @@ class SecretScanner:
                 results.append(result)
 
         self.cache.save()
-        return Results(results=results)
+        return self._build_results(results)
+
+    def _build_results(self, results: List[Result]) -> Results:
+        """
+        Build the final Results, recording the files which could not be read at
+        all: such a scan is reported as incomplete, not as "no secret found".
+        """
+        scan_results = Results(results=results)
+        if self.unreadable_files:
+            scan_results.incomplete = True
+            for scannable, reason in self.unreadable_files:
+                scan_results.errors.append(
+                    Error(
+                        files=[(scannable.filename, scannable.filemode)],
+                        description=f"could not be read: {reason}",
+                    )
+                )
+        return scan_results
 
 
 def handle_scan_chunk_error(detail: Detail, chunk: List[Scannable]) -> None:

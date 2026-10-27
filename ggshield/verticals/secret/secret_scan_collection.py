@@ -227,6 +227,15 @@ class Error(NamedTuple):
     description: str  # Description of the error
 
 
+def make_file_error(filename: str, description: str) -> Error:
+    """
+    Build an Error about a regular file on disk (for example a member of an
+    archive which could not be extracted). Keeps callers which must not depend
+    on git helpers from having to import Filemode directly.
+    """
+    return Error(files=[(filename, Filemode.FILE)], description=description)
+
+
 @dataclass
 class Results:
     """
@@ -240,6 +249,10 @@ class Results:
 
     results: List[Result] = field(default_factory=list)
     errors: List[Error] = field(default_factory=list)
+    # True when the input could not be scanned entirely (for example because one
+    # of the files could not be read). "No secret found" on an incomplete scan
+    # must not be reported the same way as a fully successful one.
+    incomplete: bool = False
 
     def by_url(self) -> Dict[str, Result]:
         """Results keyed by the url of the document each is about.
@@ -262,6 +275,7 @@ class Results:
     def extend(self, others: "Results") -> None:
         self.results.extend(others.results)
         self.errors.extend(others.errors)
+        self.incomplete = self.incomplete or others.incomplete
 
     @property
     def has_secrets(self) -> bool:
@@ -310,6 +324,26 @@ class SecretScanCollection:
             for scan in self.scans:
                 if scan.results:
                     yield from scan.results.results
+
+    def get_all_errors(self) -> Iterable[Error]:
+        """Returns an iterable on all errors of this scan and its sub-scans"""
+        if self.results:
+            yield from self.results.errors
+        if self.scans:
+            for scan in self.scans:
+                yield from scan.get_all_errors()
+
+    @property
+    def is_incomplete(self) -> bool:
+        """
+        True when some part of the input could not be scanned, either in this
+        scan or in one of its sub-scans.
+        """
+        if self.results is not None and self.results.incomplete:
+            return True
+        if self.scans is not None and any(scan.is_incomplete for scan in self.scans):
+            return True
+        return False
 
     def get_incident_details(self, client: GGClient) -> Dict[str, SecretIncident]:
         incident_details: dict[str, SecretIncident] = {}
