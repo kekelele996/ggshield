@@ -10,6 +10,7 @@ from ggshield.core.config.user_config import SecretConfig
 from ggshield.core.scan import Commit, ScanContext, ScanMode
 from ggshield.core.scan.commit_information import CommitInformation
 from ggshield.core.scan.commit_utils import CommitScannable
+from ggshield.core.scan_progress import ScanProgress
 from ggshield.verticals.secret import Result, Results
 from ggshield.verticals.secret.repo import (
     get_commits_by_batch,
@@ -18,6 +19,57 @@ from ggshield.verticals.secret.repo import (
 )
 from ggshield.verticals.secret.secret_scan_collection import SecretScanCollection
 from tests.unit.conftest import _ONE_LINE_AND_MULTILINE_PATCH_CONTENT, TWO_POLICY_BREAKS
+
+
+def _empty_batch_scan():
+    return SecretScanCollection(id="batch", type="commit-range", scans=[])
+
+
+def _commit_from_sha(sha: str) -> Commit:
+    return Commit(
+        sha=sha,
+        patch_parser=MagicMock(),
+        info=CommitInformation(author="", email="", date="", paths=[Path("f")]),
+    )
+
+
+def _client_with_one_document_per_batch() -> MagicMock:
+    client = MagicMock()
+    client.secret_scan_preferences.maximum_documents_per_scan = 1
+    return client
+
+
+def _make_scan_progress(
+    tmp_path: Path, secret_config: SecretConfig = None
+) -> ScanProgress:
+    secret_config = secret_config or SecretConfig()
+    return ScanProgress(
+        cache_path=tmp_path / "scan-progress.json",
+        repository="example.com/repo",
+        fingerprint=ScanProgress.build_fingerprint(
+            mode=ScanMode.COMMIT_RANGE.value,
+            instance="https://api.example.com",
+            secret_config=secret_config,
+            exclusion_regexes=set(),
+        ),
+        mode=ScanMode.COMMIT_RANGE.value,
+        instance="https://api.example.com",
+    )
+
+
+def _run_commit_range(
+    shas, secret_config=None, progress: ScanProgress = None, tmp_path: Path = None
+):
+    return scan_commit_range(
+        client=_client_with_one_document_per_batch(),
+        cache=MagicMock(),
+        commit_list=shas,
+        output_handler=MagicMock(),
+        exclusion_regexes=set(),
+        scan_context=ScanContext(scan_mode=ScanMode.COMMIT_RANGE, command_path="x"),
+        secret_config=secret_config or SecretConfig(),
+        progress=progress if progress is not None else _make_scan_progress(tmp_path),
+    )
 
 
 @pytest.mark.parametrize(
@@ -357,3 +409,145 @@ def test_scan_commit_range_scans_batches_in_parallel(
 
     # Sequential scanning would give ["start", "end", "start", "end"]
     assert events[:2] == ["start", "start"]
+
+
+@patch("ggshield.verticals.secret.repo.MAX_WORKERS", 2)
+@patch("ggshield.verticals.secret.repo.get_required_token_scopes_from_config")
+@patch("ggshield.verticals.secret.repo.check_client_api_key")
+@patch("ggshield.verticals.secret.repo.Commit.from_sha")
+@patch("ggshield.verticals.secret.repo.scan_commits_content")
+def test_scan_commit_range_resumes_completed_commits(
+    scan_commits_content_mock, from_sha_mock, _check_api_key, _scopes, tmp_path
+):
+    """
+    GIVEN a first successful scan and a second scan of the same range with the
+    same repository/scope/configuration
+    WHEN resuming
+    THEN previously scanned commits are not scanned again and are counted as
+    resumed
+    """
+    from_sha_mock.side_effect = lambda sha, exclusion_regexes: _commit_from_sha(sha)
+    scan_commits_content_mock.side_effect = lambda commits, *args: _empty_batch_scan()
+    shas = [f"sha{i}" for i in range(4)]
+
+    _run_commit_range(shas, tmp_path=tmp_path)
+    assert scan_commits_content_mock.call_count == 4
+
+    reloaded = _make_scan_progress(tmp_path)
+    _run_commit_range(shas, progress=reloaded)
+
+    assert scan_commits_content_mock.call_count == 4
+    assert reloaded.resumed_count == 4
+    assert reloaded.retried_count == 0
+
+
+@patch("ggshield.verticals.secret.repo.MAX_WORKERS", 2)
+@patch("ggshield.verticals.secret.repo.get_required_token_scopes_from_config")
+@patch("ggshield.verticals.secret.repo.check_client_api_key")
+@patch("ggshield.verticals.secret.repo.Commit.from_sha")
+@patch("ggshield.verticals.secret.repo.scan_commits_content")
+def test_scan_commit_range_grown_range_only_scans_new_commits(
+    scan_commits_content_mock, from_sha_mock, _check_api_key, _scopes, tmp_path
+):
+    """
+    GIVEN a completed scan of a range
+    WHEN the same scan runs on a range grown with new commits
+    THEN only the new commits are scanned
+    """
+    from_sha_mock.side_effect = lambda sha, exclusion_regexes: _commit_from_sha(sha)
+    scan_commits_content_mock.side_effect = lambda commits, *args: _empty_batch_scan()
+
+    _run_commit_range(["sha1", "sha2", "sha3"], tmp_path=tmp_path)
+    assert scan_commits_content_mock.call_count == 3
+
+    reloaded = _make_scan_progress(tmp_path)
+    _run_commit_range(["sha1", "sha2", "sha3", "sha4"], progress=reloaded)
+
+    assert scan_commits_content_mock.call_count == 4
+    assert reloaded.resumed_count == 3
+    assert reloaded.retried_count == 0
+
+
+@patch("ggshield.verticals.secret.repo.MAX_WORKERS", 2)
+@patch("ggshield.verticals.secret.repo.get_required_token_scopes_from_config")
+@patch("ggshield.verticals.secret.repo.check_client_api_key")
+@patch("ggshield.verticals.secret.repo.Commit.from_sha")
+@patch("ggshield.verticals.secret.repo.scan_commits_content")
+def test_scan_commit_range_config_change_rescans_everything(
+    scan_commits_content_mock, from_sha_mock, _check_api_key, _scopes, tmp_path
+):
+    """
+    GIVEN a completed scan under one configuration
+    WHEN the same range is scanned with a different configuration
+    THEN no commit is skipped using the old progress
+    """
+    from_sha_mock.side_effect = lambda sha, exclusion_regexes: _commit_from_sha(sha)
+    scan_commits_content_mock.side_effect = lambda commits, *args: _empty_batch_scan()
+    shas = [f"sha{i}" for i in range(3)]
+
+    _run_commit_range(shas, secret_config=SecretConfig(), tmp_path=tmp_path)
+    assert scan_commits_content_mock.call_count == 3
+
+    other_config = SecretConfig(ignored_detectors={"some_detector"})
+    reloaded = _make_scan_progress(tmp_path, secret_config=other_config)
+    _run_commit_range(shas, secret_config=other_config, progress=reloaded)
+
+    assert scan_commits_content_mock.call_count == 6
+    assert reloaded.resumed_count == 0
+
+
+@patch("ggshield.verticals.secret.repo.MAX_WORKERS", 2)
+@patch("ggshield.verticals.secret.repo.get_required_token_scopes_from_config")
+@patch("ggshield.verticals.secret.repo.check_client_api_key")
+@patch("ggshield.verticals.secret.repo.Commit.from_sha")
+@patch("ggshield.verticals.secret.repo.scan_commits_content")
+def test_scan_commit_range_retries_failed_commits_and_reports(
+    scan_commits_content_mock, from_sha_mock, _check_api_key, _scopes, tmp_path, capsys
+):
+    """
+    GIVEN a scan interrupted while scanning its 3rd batch
+    WHEN the scan is resumed
+    THEN the failed commit is marked failed and retried with the other missing
+    commits, counted as a retry, and the end-of-scan report lists both counts
+    """
+    from_sha_mock.side_effect = lambda sha, exclusion_regexes: _commit_from_sha(sha)
+    shas = [f"sha{i}" for i in range(5)]
+
+    def fail_sha2_batch(commits, *args):
+        if commits[0].sha == "sha2":
+            raise RuntimeError("boom")
+        return _empty_batch_scan()
+
+    scan_commits_content_mock.side_effect = fail_sha2_batch
+
+    with pytest.raises(RuntimeError, match="boom"):
+        _run_commit_range(shas, tmp_path=tmp_path)
+
+    interrupted = _make_scan_progress(tmp_path)
+    assert interrupted.plan(shas) == ["sha2", "sha3", "sha4"]
+    assert interrupted.scope.failed == {"sha2": "boom"}
+
+    resumed_shas = []
+
+    def record_resumed(commits, *args):
+        resumed_shas.extend(commit.sha for commit in commits)
+        return _empty_batch_scan()
+
+    scan_commits_content_mock.side_effect = record_resumed
+
+    reloaded = _make_scan_progress(tmp_path)
+    _run_commit_range(shas, progress=reloaded)
+
+    # Worker scheduling makes task start order non-deterministic, only the set
+    # of rescanned commits is meaningful.
+    assert sorted(resumed_shas) == ["sha2", "sha3", "sha4"]
+    assert reloaded.resumed_count == 2
+    assert reloaded.retried_count == 1
+    assert reloaded.scope.failed == {}
+
+    after = _make_scan_progress(tmp_path)
+    assert after.plan(shas) == []
+
+    err = capsys.readouterr().err
+    assert "skipped 2 previously scanned commits" in err
+    assert "retried 1 previously failed commit" in err

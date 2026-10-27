@@ -2,10 +2,10 @@ import itertools
 import logging
 import traceback
 from collections.abc import Iterable, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from re import Pattern
-from typing import Callable, List, Set
+from typing import Callable, List, Optional, Set, Tuple
 
 from click import UsageError
 from pygitguardian import GGClient
@@ -18,8 +18,9 @@ from ggshield.core.config.user_config import SecretConfig
 from ggshield.core.constants import MAX_WORKERS
 from ggshield.core.errors import ExitCode, QuotaLimitReachedError, handle_exception
 from ggshield.core.scan import Commit, ScanContext
+from ggshield.core.scan_progress import ScanProgress
 from ggshield.core.scanner_ui import create_message_only_scanner_ui
-from ggshield.core.text_utils import STYLE, format_text
+from ggshield.core.text_utils import STYLE, format_text, pluralize
 from ggshield.utils.git_shell import get_list_commit_SHA, is_git_dir
 from ggshield.utils.os import cd
 from ggshield.verticals.secret.secret_scanner import (
@@ -52,6 +53,12 @@ def scan_repo_path(
             raise UsageError(f"{repo_path} is not a git repository")
 
         with cd(repo_path):
+            progress = ScanProgress.create(
+                client=client,
+                scan_context=scan_context,
+                secret_config=config.user_config.secret,
+                exclusion_regexes=exclusion_regexes,
+            )
             return scan_commit_range(
                 client=client,
                 cache=cache,
@@ -60,6 +67,7 @@ def scan_repo_path(
                 exclusion_regexes=exclusion_regexes,
                 scan_context=scan_context,
                 secret_config=config.user_config.secret,
+                progress=progress,
             )
     except Exception as error:
         return handle_exception(error)
@@ -173,6 +181,7 @@ def scan_commit_range(
     scan_context: ScanContext,
     secret_config: SecretConfig,
     include_staged: bool = False,
+    progress: Optional[ScanProgress] = None,
 ) -> ExitCode:
     """
     Scan every commit in a range.
@@ -180,11 +189,28 @@ def scan_commit_range(
     :param client: Public Scanning API client
     :param commit_list: List of commits sha to scan
     :param verbose: Display successful scan's message
+    :param progress: When provided, commits recorded as already scanned in it
+        are skipped and the state is updated after each batch, which allows
+        interrupted scans to resume without scanning the same commits twice.
     """
     check_client_api_key(client, get_required_token_scopes_from_config(secret_config))
     max_documents = client.secret_scan_preferences.maximum_documents_per_scan
 
-    with ui.create_progress(len(commit_list) + int(include_staged)) as progress:
+    commits_to_scan = commit_list
+    if progress is not None:
+        commits_to_scan = progress.plan(commit_list)
+        if progress.resumed_count or progress.retried_count:
+            ui.display_verbose(
+                f"Resuming scan: {progress.resumed_count} already scanned "
+                f"commit(s) skipped, {progress.retried_count} previously failed "
+                "commit(s) will be retried."
+            )
+
+    with ui.create_progress(len(commit_list) + int(include_staged)) as progress_bar:
+        # Already scanned commits are completed work, advance the bar at once.
+        if progress is not None:
+            progress_bar.advance(progress.resumed_count)
+
         commits_iters: list[Iterable[Commit]] = []
         if include_staged:
             commits_iters.append(
@@ -192,7 +218,7 @@ def scan_commit_range(
             )
         commits_iters.append(
             Commit.from_sha(sha, exclusion_regexes=exclusion_regexes)
-            for sha in commit_list
+            for sha in commits_to_scan
         )
         commits_batch = get_commits_by_batch(
             commits=itertools.chain(*commits_iters),
@@ -207,34 +233,70 @@ def scan_commit_range(
                 ui.display_verbose(f"Scanned {commit.sha}")
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = []
+            # Track the commits of each future so progress can be recorded per
+            # batch in submission order.
+            futures: List[Tuple[Future, List[Commit]]] = []
             for commits in commits_batch:
+                # The last batch can be empty when every commit was already
+                # scanned: don't submit a useless scan for it.
+                if not commits:
+                    continue
                 futures.append(
-                    executor.submit(
-                        scan_commits_content,
+                    (
+                        executor.submit(
+                            scan_commits_content,
+                            commits,
+                            client,
+                            cache,
+                            scan_context,
+                            secret_config,
+                            progress_bar.advance,
+                            commit_scanned_callback,
+                        ),
                         commits,
-                        client,
-                        cache,
-                        scan_context,
-                        secret_config,
-                        progress.advance,
-                        commit_scanned_callback,
                     )
                 )
 
             try:
                 # in submission order so we preserve the order
-                for future in futures:
-                    scan_collection = future.result()
+                for future, batch_commits in futures:
+                    try:
+                        scan_collection = future.result()
+                    except Exception as exc:
+                        # Persist the interrupted batch as failed so the next
+                        # run retries it; in-flight batches stay untracked and
+                        # are simply scanned again.
+                        if progress is not None:
+                            progress.mark_failed(
+                                _commit_shas(batch_commits),
+                                str(exc) or exc.__class__.__name__,
+                            )
+                        raise
+                    batch_errors: List[str] = []
                     for scan in scan_collection.scans_with_results:
                         if scan.results and scan.results.errors:
                             for error in scan.results.errors:
                                 ui.display_error(error.description)
+                                batch_errors.append(error.description)
                         scans.append(scan)
+                    if progress is not None:
+                        batch_shas = _commit_shas(batch_commits)
+                        if batch_errors:
+                            progress.mark_failed(batch_shas, batch_errors[0])
+                        else:
+                            progress.mark_completed(batch_shas)
             except Exception:
                 # Don't run the remaining batches if one already failed
                 executor.shutdown(cancel_futures=True)
                 raise
+
+    if progress is not None and (progress.resumed_count or progress.retried_count):
+        ui.display_info(
+            f"Resumed scan: skipped {progress.resumed_count} previously scanned "
+            f"{pluralize('commit', progress.resumed_count)}, retried "
+            f"{progress.retried_count} previously failed "
+            f"{pluralize('commit', progress.retried_count)}."
+        )
 
     return_code = output_handler.process_scan(
         SecretScanCollection(
@@ -242,3 +304,8 @@ def scan_commit_range(
         )
     )
     return return_code
+
+
+def _commit_shas(commits: List[Commit]) -> List[str]:
+    """Return the non-None SHAs (i.e. excluding staged changes) of a batch."""
+    return [commit.sha for commit in commits if commit.sha is not None]

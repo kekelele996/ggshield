@@ -13,6 +13,7 @@ from ggshield.cmd.utils.context_obj import ContextObj
 from ggshield.core import ui
 from ggshield.core.client import create_client_from_config
 from ggshield.core.scan import ScanContext, ScanMode
+from ggshield.core.scan_progress import ScanProgress
 from ggshield.utils.git_shell import get_list_commit_SHA
 from ggshield.verticals.secret.repo import scan_commit_range
 
@@ -49,6 +50,13 @@ def range_cmd(
         target_path=Path.cwd(),
     )
 
+    progress = ScanProgress.create(
+        client=ctx_obj.client,
+        scan_context=scan_context,
+        secret_config=config.user_config.secret,
+        exclusion_regexes=ctx_obj.exclusion_regexes,
+    )
+
     return scan_commit_range(
         client=ctx_obj.client,
         cache=ctx_obj.cache,
@@ -57,4 +65,5 @@ def range_cmd(
         exclusion_regexes=ctx_obj.exclusion_regexes,
         secret_config=config.user_config.secret,
         scan_context=scan_context,
+        progress=progress,
     )
